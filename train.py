@@ -204,7 +204,7 @@ def main() -> None:
         focal_gamma=args.focal_gamma,
         focal_alpha=args.focal_alpha,
         class_weights=class_weights,
-    )
+    ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
     scaler = torch.amp.GradScaler("cuda", enabled=torch.cuda.is_available())
