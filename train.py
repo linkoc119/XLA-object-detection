@@ -32,14 +32,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--val_every", type=int, default=1)
-    parser.add_argument("--conf_threshold", type=float, default=0.25)
+    parser.add_argument("--conf_threshold", type=float, default=0.005)
     parser.add_argument("--nms_iou", type=float, default=0.5)
     parser.add_argument("--max_detections", type=int, default=100)
+    parser.add_argument("--assign_radius", type=int, default=1, help="Positive center assignment radius in feature cells. 1 means a 3x3 region.")
+    parser.add_argument("--focal_gamma", type=float, default=2.0)
+    parser.add_argument("--focal_alpha", type=float, default=0.25)
+    parser.add_argument(
+        "--class_weights",
+        default="1.0,1.3,1.4,1.2,1.8",
+        help="Comma-separated weights for person,car,dog,cat,chair.",
+    )
     parser.add_argument("--limit_train", type=int, default=0, help="Optional smoke-test limit.")
     parser.add_argument("--limit_val", type=int, default=0, help="Optional smoke-test limit.")
     parser.add_argument("--no_pretrained_backbone", action="store_true")
     parser.add_argument("--resume", default=None)
     return parser.parse_args()
+
+
+def parse_class_weights(value: str) -> list[float]:
+    weights = [float(item.strip()) for item in value.split(",") if item.strip()]
+    if len(weights) != len(CLASS_TO_IDX):
+        raise ValueError(f"--class_weights must have {len(CLASS_TO_IDX)} comma-separated values.")
+    return weights
 
 
 def move_batch_to_device(batch: dict, device: torch.device) -> dict:
@@ -87,6 +102,35 @@ def save_json(path: Path, data: object) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def save_checkpoint(
+    path: Path,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    best_map: float,
+    args: argparse.Namespace,
+    class_weights: list[float],
+) -> None:
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "epoch": epoch,
+            "best_map": best_map,
+            "classes": list(CLASS_TO_IDX.keys()),
+            "image_size": args.image_size,
+            "conf_threshold": args.conf_threshold,
+            "nms_iou": args.nms_iou,
+            "architecture": "YoloResNet50",
+            "assign_radius": args.assign_radius,
+            "focal_gamma": args.focal_gamma,
+            "focal_alpha": args.focal_alpha,
+            "class_weights": class_weights,
+        },
+        path,
+    )
+
+
 def append_experiment_log(path: Path, args: argparse.Namespace, best_score: dict, best_epoch: int, checkpoint_path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     run_name = args.experiment_name or f"resnet50-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
@@ -103,6 +147,8 @@ def append_experiment_log(path: Path, args: argparse.Namespace, best_score: dict
         f"- Batch size: {args.batch_size}",
         f"- Epochs: {args.epochs}",
         f"- Optimizer: AdamW lr={args.lr}, weight_decay={args.weight_decay}",
+        f"- Assignment: center radius={args.assign_radius}",
+        f"- Loss: focal_gamma={args.focal_gamma}, focal_alpha={args.focal_alpha}, class_weights={args.class_weights}",
         f"- Inference: conf_threshold={args.conf_threshold}, nms_iou={args.nms_iou}, max_detections={args.max_detections}",
         f"- Best epoch: {best_epoch}",
         f"- Checkpoint: {checkpoint_path.as_posix()}",
@@ -120,6 +166,7 @@ def append_experiment_log(path: Path, args: argparse.Namespace, best_score: dict
 def main() -> None:
     args = parse_args()
     torch.manual_seed(42)
+    class_weights = parse_class_weights(args.class_weights)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint_dir = Path(args.checkpoint_dir)
@@ -150,7 +197,14 @@ def main() -> None:
     )
 
     model = YoloResNet50(num_classes=len(CLASS_TO_IDX), pretrained_backbone=not args.no_pretrained_backbone).to(device)
-    criterion = DetectionLoss(num_classes=len(CLASS_TO_IDX), image_size=args.image_size)
+    criterion = DetectionLoss(
+        num_classes=len(CLASS_TO_IDX),
+        image_size=args.image_size,
+        assign_radius=args.assign_radius,
+        focal_gamma=args.focal_gamma,
+        focal_alpha=args.focal_alpha,
+        class_weights=class_weights,
+    )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
     scaler = torch.amp.GradScaler("cuda", enabled=torch.cuda.is_available())
@@ -160,6 +214,7 @@ def main() -> None:
     best_epoch = 0
     best_score: dict = {"mAP@0.5": 0.0}
     best_path = checkpoint_dir / "best.pth"
+    last_path = checkpoint_dir / "last.pth"
 
     if args.resume:
         checkpoint = torch.load(args.resume, map_location=device)
@@ -188,6 +243,8 @@ def main() -> None:
                 running[key] += metrics[key]
             progress.set_postfix({key: f"{running[key] / step:.4f}" for key in ("loss", "obj_loss", "cls_loss", "box_loss")})
         scheduler.step()
+        save_checkpoint(last_path, model, optimizer, epoch, best_map, args, class_weights)
+        print(f"Saved latest checkpoint to {last_path}")
 
         if epoch % args.val_every == 0 or epoch == args.epochs:
             val_predictions, score = validate(
@@ -208,20 +265,7 @@ def main() -> None:
                 best_map = current_map
                 best_epoch = epoch
                 best_score = score
-                torch.save(
-                    {
-                        "model": model.state_dict(),
-                        "optimizer": optimizer.state_dict(),
-                        "epoch": epoch,
-                        "best_map": best_map,
-                        "classes": list(CLASS_TO_IDX.keys()),
-                        "image_size": args.image_size,
-                        "conf_threshold": args.conf_threshold,
-                        "nms_iou": args.nms_iou,
-                        "architecture": "YoloResNet50",
-                    },
-                    best_path,
-                )
+                save_checkpoint(best_path, model, optimizer, epoch, best_map, args, class_weights)
                 print(f"Saved best checkpoint to {best_path}")
 
     append_experiment_log(Path(args.experiment_log), args, best_score, best_epoch, best_path)

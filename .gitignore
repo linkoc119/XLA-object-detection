@@ -208,6 +208,6 @@ val_score_*.json
 score.json
 score_*.json
 classes.json
-
+local_runs/
 # Large local reference files not needed for code training
 paper/*.pdf
