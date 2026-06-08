@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 from datetime import datetime
 from pathlib import Path
@@ -35,6 +36,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--conf_threshold", type=float, default=0.005)
     parser.add_argument("--nms_iou", type=float, default=0.5)
     parser.add_argument("--max_detections", type=int, default=100)
+    parser.add_argument("--neck_variant", choices=["baseline", "csp"], default="csp")
+    parser.add_argument("--head_variant", choices=["coupled", "decoupled"], default="decoupled")
+    parser.add_argument("--use_attention", action="store_true")
+    parser.add_argument("--ema_decay", type=float, default=0.9998)
+    parser.add_argument("--no_ema", action="store_true")
     parser.add_argument("--assign_radius", type=int, default=1, help="Positive center assignment radius in feature cells. 1 means a 3x3 region.")
     parser.add_argument("--focal_gamma", type=float, default=2.0)
     parser.add_argument("--focal_alpha", type=float, default=0.25)
@@ -63,6 +69,24 @@ def move_batch_to_device(batch: dict, device: torch.device) -> dict:
     batch["boxes"] = [boxes.to(device) for boxes in batch["boxes"]]
     batch["labels"] = [labels.to(device) for labels in batch["labels"]]
     return batch
+
+
+class ModelEMA:
+    def __init__(self, model: torch.nn.Module, decay: float):
+        self.ema = copy.deepcopy(model).eval()
+        self.decay = decay
+        for parameter in self.ema.parameters():
+            parameter.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module) -> None:
+        model_state = model.state_dict()
+        for name, ema_value in self.ema.state_dict().items():
+            model_value = model_state[name].detach()
+            if ema_value.dtype.is_floating_point:
+                ema_value.mul_(self.decay).add_(model_value, alpha=1.0 - self.decay)
+            else:
+                ema_value.copy_(model_value)
 
 
 @torch.no_grad()
@@ -110,23 +134,32 @@ def save_checkpoint(
     best_map: float,
     args: argparse.Namespace,
     class_weights: list[float],
+    ema_model: torch.nn.Module | None = None,
 ) -> None:
+    checkpoint = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "epoch": epoch,
+        "best_map": best_map,
+        "classes": list(CLASS_TO_IDX.keys()),
+        "image_size": args.image_size,
+        "conf_threshold": args.conf_threshold,
+        "nms_iou": args.nms_iou,
+        "architecture": "YoloResNet50",
+        "neck_variant": args.neck_variant,
+        "head_variant": args.head_variant,
+        "use_attention": args.use_attention,
+        "use_ema": not args.no_ema,
+        "ema_decay": args.ema_decay,
+        "assign_radius": args.assign_radius,
+        "focal_gamma": args.focal_gamma,
+        "focal_alpha": args.focal_alpha,
+        "class_weights": class_weights,
+    }
+    if ema_model is not None:
+        checkpoint["ema_model"] = ema_model.state_dict()
     torch.save(
-        {
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "epoch": epoch,
-            "best_map": best_map,
-            "classes": list(CLASS_TO_IDX.keys()),
-            "image_size": args.image_size,
-            "conf_threshold": args.conf_threshold,
-            "nms_iou": args.nms_iou,
-            "architecture": "YoloResNet50",
-            "assign_radius": args.assign_radius,
-            "focal_gamma": args.focal_gamma,
-            "focal_alpha": args.focal_alpha,
-            "class_weights": class_weights,
-        },
+        checkpoint,
         path,
     )
 
@@ -143,6 +176,8 @@ def append_experiment_log(path: Path, args: argparse.Namespace, best_score: dict
         "- Backbone: ResNet-50 ImageNet pretrained"
         + (" disabled" if args.no_pretrained_backbone else " enabled"),
         "- Architecture: ResNet-50 C3/C4/C5 + custom FPN/PAN + SPPF + anchor-free head",
+        f"- Neck/head: neck_variant={args.neck_variant}, head_variant={args.head_variant}, use_attention={args.use_attention}",
+        f"- EMA: enabled={not args.no_ema}, decay={args.ema_decay}",
         f"- Image size: {args.image_size}",
         f"- Batch size: {args.batch_size}",
         f"- Epochs: {args.epochs}",
@@ -171,6 +206,13 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint_dir = Path(args.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    resume_checkpoint = None
+    if args.resume:
+        resume_checkpoint = torch.load(args.resume, map_location=device)
+        args.image_size = int(resume_checkpoint.get("image_size", args.image_size))
+        args.neck_variant = resume_checkpoint.get("neck_variant", "baseline")
+        args.head_variant = resume_checkpoint.get("head_variant", "coupled")
+        args.use_attention = bool(resume_checkpoint.get("use_attention", False))
 
     train_dataset = DetectionDataset(args.train_data, args.image_dir, image_size=args.image_size, train=True)
     val_dataset = DetectionDataset(args.val_data, args.val_image_dir, image_size=args.image_size, train=False)
@@ -196,7 +238,13 @@ def main() -> None:
         collate_fn=collate_fn,
     )
 
-    model = YoloResNet50(num_classes=len(CLASS_TO_IDX), pretrained_backbone=not args.no_pretrained_backbone).to(device)
+    model = YoloResNet50(
+        num_classes=len(CLASS_TO_IDX),
+        pretrained_backbone=not args.no_pretrained_backbone,
+        neck_variant=args.neck_variant,
+        head_variant=args.head_variant,
+        use_attention=args.use_attention,
+    ).to(device)
     criterion = DetectionLoss(
         num_classes=len(CLASS_TO_IDX),
         image_size=args.image_size,
@@ -208,6 +256,7 @@ def main() -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
     scaler = torch.amp.GradScaler("cuda", enabled=torch.cuda.is_available())
+    ema = None if args.no_ema else ModelEMA(model, decay=args.ema_decay)
 
     start_epoch = 1
     best_map = -1.0
@@ -216,10 +265,12 @@ def main() -> None:
     best_path = checkpoint_dir / "best.pth"
     last_path = checkpoint_dir / "last.pth"
 
-    if args.resume:
-        checkpoint = torch.load(args.resume, map_location=device)
+    if resume_checkpoint is not None:
+        checkpoint = resume_checkpoint
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint.get("optimizer", optimizer.state_dict()))
+        if ema is not None and "ema_model" in checkpoint:
+            ema.ema.load_state_dict(checkpoint["ema_model"])
         start_epoch = int(checkpoint.get("epoch", 0)) + 1
         best_map = float(checkpoint.get("best_map", -1.0))
 
@@ -238,17 +289,20 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
             scaler.step(optimizer)
             scaler.update()
+            if ema is not None:
+                ema.update(model)
 
             for key in running:
                 running[key] += metrics[key]
             progress.set_postfix({key: f"{running[key] / step:.4f}" for key in ("loss", "obj_loss", "cls_loss", "box_loss")})
         scheduler.step()
-        save_checkpoint(last_path, model, optimizer, epoch, best_map, args, class_weights)
+        eval_model = ema.ema if ema is not None else model
+        save_checkpoint(last_path, model, optimizer, epoch, best_map, args, class_weights, ema_model=eval_model if ema is not None else None)
         print(f"Saved latest checkpoint to {last_path}")
 
         if epoch % args.val_every == 0 or epoch == args.epochs:
             val_predictions, score = validate(
-                model,
+                eval_model,
                 val_loader,
                 device,
                 args.val_data,
@@ -265,7 +319,7 @@ def main() -> None:
                 best_map = current_map
                 best_epoch = epoch
                 best_score = score
-                save_checkpoint(best_path, model, optimizer, epoch, best_map, args, class_weights)
+                save_checkpoint(best_path, model, optimizer, epoch, best_map, args, class_weights, ema_model=eval_model if ema is not None else None)
                 print(f"Saved best checkpoint to {best_path}")
 
     append_experiment_log(Path(args.experiment_log), args, best_score, best_epoch, best_path)

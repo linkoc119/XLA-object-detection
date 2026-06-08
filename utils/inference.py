@@ -19,6 +19,7 @@ def decode_outputs(
     nms_iou: float = 0.5,
     max_detections: int = 100,
     strides: tuple[int, int, int] = (8, 16, 32),
+    flip_horizontal: bool = False,
 ) -> list[list[dict[str, object]]]:
     batch_size = outputs[0].shape[0]
     all_results: list[list[dict[str, object]]] = [[] for _ in range(batch_size)]
@@ -85,6 +86,11 @@ def decode_outputs(
         pad_x = pad_xs[batch_idx]
         pad_y = pad_ys[batch_idx]
         final_boxes = boxes[final_indices].clone()
+        if flip_horizontal:
+            x1 = final_boxes[:, 0].clone()
+            x2 = final_boxes[:, 2].clone()
+            final_boxes[:, 0] = image_size - x2
+            final_boxes[:, 2] = image_size - x1
         final_boxes[:, [0, 2]] = (final_boxes[:, [0, 2]] - pad_x) / scale
         final_boxes[:, [1, 3]] = (final_boxes[:, [1, 3]] - pad_y) / scale
         final_boxes = clip_boxes(final_boxes, orig_w, orig_h)
