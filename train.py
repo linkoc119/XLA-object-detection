@@ -33,14 +33,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--val_every", type=int, default=1)
-    parser.add_argument("--conf_threshold", type=float, default=0.005)
+    parser.add_argument("--conf_threshold", type=float, default=0.01)
     parser.add_argument("--nms_iou", type=float, default=0.5)
     parser.add_argument("--max_detections", type=int, default=100)
-    parser.add_argument("--neck_variant", choices=["baseline", "csp"], default="csp")
-    parser.add_argument("--head_variant", choices=["coupled", "decoupled"], default="decoupled")
+    parser.add_argument("--neck_variant", choices=["baseline", "csp"], default="baseline")
+    parser.add_argument("--head_variant", choices=["coupled", "decoupled"], default="coupled")
     parser.add_argument("--use_attention", action="store_true")
     parser.add_argument("--ema_decay", type=float, default=0.9998)
+    parser.add_argument("--use_ema", action="store_false", dest="no_ema")
     parser.add_argument("--no_ema", action="store_true")
+    parser.set_defaults(no_ema=True)
     parser.add_argument("--assign_radius", type=int, default=1, help="Positive center assignment radius in feature cells. 1 means a 3x3 region.")
     parser.add_argument("--focal_gamma", type=float, default=2.0)
     parser.add_argument("--focal_alpha", type=float, default=0.25)
@@ -53,6 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit_val", type=int, default=0, help="Optional smoke-test limit.")
     parser.add_argument("--no_pretrained_backbone", action="store_true")
     parser.add_argument("--resume", default=None)
+    parser.add_argument("--reset_optimizer", action="store_true", help="When resuming, start with a fresh optimizer and scheduler.")
     return parser.parse_args()
 
 
@@ -284,7 +287,8 @@ def main() -> None:
     if resume_checkpoint is not None:
         checkpoint = resume_checkpoint
         model.load_state_dict(checkpoint["model"])
-        optimizer.load_state_dict(checkpoint.get("optimizer", optimizer.state_dict()))
+        if not args.reset_optimizer:
+            optimizer.load_state_dict(checkpoint.get("optimizer", optimizer.state_dict()))
         if ema is not None and "ema_model" in checkpoint:
             ema.load_state_dict(checkpoint.get("ema", checkpoint["ema_model"]))
         start_epoch = int(checkpoint.get("epoch", 0)) + 1

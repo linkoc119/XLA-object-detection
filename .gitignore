@@ -193,6 +193,7 @@ runs/
 checkpoints/
 outputs/
 kaggle/working/
+public/
 
 # Model checkpoints and exported weights
 *.pth
