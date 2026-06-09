@@ -49,6 +49,66 @@ def generalized_iou_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tens
     return (1.0 - giou).mean()
 
 
+def distance_iou_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    if pred.numel() == 0:
+        return pred.sum()
+
+    inter_lt = torch.maximum(pred[:, :2], target[:, :2])
+    inter_rb = torch.minimum(pred[:, 2:], target[:, 2:])
+    inter_wh = (inter_rb - inter_lt).clamp(min=0)
+    inter = inter_wh[:, 0] * inter_wh[:, 1]
+
+    pred_wh = (pred[:, 2:] - pred[:, :2]).clamp(min=0)
+    target_wh = (target[:, 2:] - target[:, :2]).clamp(min=0)
+    pred_area = pred_wh[:, 0] * pred_wh[:, 1]
+    target_area = target_wh[:, 0] * target_wh[:, 1]
+    union = pred_area + target_area - inter
+    iou = inter / union.clamp(min=1e-6)
+
+    pred_center = (pred[:, :2] + pred[:, 2:]) * 0.5
+    target_center = (target[:, :2] + target[:, 2:]) * 0.5
+    center_dist = ((pred_center - target_center) ** 2).sum(dim=1)
+
+    enc_lt = torch.minimum(pred[:, :2], target[:, :2])
+    enc_rb = torch.maximum(pred[:, 2:], target[:, 2:])
+    enc_diag = ((enc_rb - enc_lt).clamp(min=0) ** 2).sum(dim=1).clamp(min=1e-6)
+    diou = iou - center_dist / enc_diag
+    return (1.0 - diou).mean()
+
+
+def complete_iou_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    if pred.numel() == 0:
+        return pred.sum()
+
+    inter_lt = torch.maximum(pred[:, :2], target[:, :2])
+    inter_rb = torch.minimum(pred[:, 2:], target[:, 2:])
+    inter_wh = (inter_rb - inter_lt).clamp(min=0)
+    inter = inter_wh[:, 0] * inter_wh[:, 1]
+
+    pred_wh = (pred[:, 2:] - pred[:, :2]).clamp(min=1e-6)
+    target_wh = (target[:, 2:] - target[:, :2]).clamp(min=1e-6)
+    pred_area = pred_wh[:, 0] * pred_wh[:, 1]
+    target_area = target_wh[:, 0] * target_wh[:, 1]
+    union = pred_area + target_area - inter
+    iou = inter / union.clamp(min=1e-6)
+
+    pred_center = (pred[:, :2] + pred[:, 2:]) * 0.5
+    target_center = (target[:, :2] + target[:, 2:]) * 0.5
+    center_dist = ((pred_center - target_center) ** 2).sum(dim=1)
+
+    enc_lt = torch.minimum(pred[:, :2], target[:, :2])
+    enc_rb = torch.maximum(pred[:, 2:], target[:, 2:])
+    enc_diag = ((enc_rb - enc_lt).clamp(min=0) ** 2).sum(dim=1).clamp(min=1e-6)
+
+    v = (4.0 / torch.pi**2) * (
+        torch.atan(target_wh[:, 0] / target_wh[:, 1]) - torch.atan(pred_wh[:, 0] / pred_wh[:, 1])
+    ).pow(2)
+    with torch.no_grad():
+        alpha = v / (1.0 - iou + v).clamp(min=1e-6)
+    ciou = iou - center_dist / enc_diag - alpha * v
+    return (1.0 - ciou).mean()
+
+
 def nms(boxes: torch.Tensor, scores: torch.Tensor, iou_threshold: float) -> torch.Tensor:
     if boxes.numel() == 0:
         return torch.empty((0,), dtype=torch.long, device=boxes.device)

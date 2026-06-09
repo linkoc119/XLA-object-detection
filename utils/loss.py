@@ -4,7 +4,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from .bbox import generalized_iou_loss
+from .bbox import complete_iou_loss, distance_iou_loss, generalized_iou_loss
 
 
 class DetectionLoss(nn.Module):
@@ -20,8 +20,11 @@ class DetectionLoss(nn.Module):
         focal_gamma: float = 2.0,
         focal_alpha: float = 0.25,
         class_weights: list[float] | tuple[float, ...] | None = None,
+        box_loss: str = "giou",
     ):
         super().__init__()
+        if box_loss not in {"giou", "diou", "ciou"}:
+            raise ValueError("box_loss must be 'giou', 'diou', or 'ciou'.")
         self.num_classes = num_classes
         self.image_size = image_size
         self.strides = strides
@@ -31,6 +34,7 @@ class DetectionLoss(nn.Module):
         self.assign_radius = assign_radius
         self.focal_gamma = focal_gamma
         self.focal_alpha = focal_alpha
+        self.box_loss = box_loss
         weights = torch.ones(num_classes, dtype=torch.float32) if class_weights is None else torch.tensor(class_weights, dtype=torch.float32)
         if weights.numel() != num_classes:
             raise ValueError(f"class_weights must contain {num_classes} values.")
@@ -147,8 +151,13 @@ class DetectionLoss(nn.Module):
                 pred_boxes = self._decode_boxes(raw_box, stride).permute(0, 2, 3, 1)[pos_mask]
                 tgt_boxes = box_target[pos_mask]
                 l1 = F.smooth_l1_loss(pred_boxes, tgt_boxes)
-                giou = generalized_iou_loss(pred_boxes, tgt_boxes)
-                box_losses.append(l1 / self.image_size + giou)
+                if self.box_loss == "ciou":
+                    iou_loss = complete_iou_loss(pred_boxes, tgt_boxes)
+                elif self.box_loss == "diou":
+                    iou_loss = distance_iou_loss(pred_boxes, tgt_boxes)
+                else:
+                    iou_loss = generalized_iou_loss(pred_boxes, tgt_boxes)
+                box_losses.append(l1 / self.image_size + iou_loss)
                 total_pos += int(pos_mask.sum().item())
 
         obj_loss = torch.stack(obj_losses).sum() if obj_losses else outputs[0].sum() * 0

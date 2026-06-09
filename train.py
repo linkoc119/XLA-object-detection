@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 from tqdm import tqdm
 
 from models import YoloResNet50
@@ -46,10 +46,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--assign_radius", type=int, default=1, help="Positive center assignment radius in feature cells. 1 means a 3x3 region.")
     parser.add_argument("--focal_gamma", type=float, default=2.0)
     parser.add_argument("--focal_alpha", type=float, default=0.25)
+    parser.add_argument("--box_loss", choices=["giou", "diou", "ciou"], default="giou")
+    parser.add_argument("--balanced_sampling", action="store_true")
+    parser.add_argument("--data_bias_init", action="store_true")
     parser.add_argument(
         "--class_weights",
         default="1.0,1.3,1.4,1.2,1.8",
         help="Comma-separated weights for person,car,dog,cat,chair.",
+    )
+    parser.add_argument(
+        "--sampler_class_weights",
+        default="1.0,1.3,1.4,1.2,2.5",
+        help="Comma-separated image sampling weights for person,car,dog,cat,chair.",
     )
     parser.add_argument("--limit_train", type=int, default=0, help="Optional smoke-test limit.")
     parser.add_argument("--limit_val", type=int, default=0, help="Optional smoke-test limit.")
@@ -64,6 +72,72 @@ def parse_class_weights(value: str) -> list[float]:
     if len(weights) != len(CLASS_TO_IDX):
         raise ValueError(f"--class_weights must have {len(CLASS_TO_IDX)} comma-separated values.")
     return weights
+
+
+def make_balanced_sampler(dataset: DetectionDataset | Subset, sampler_class_weights: list[float]) -> WeightedRandomSampler:
+    base_dataset = dataset.dataset if isinstance(dataset, Subset) else dataset
+    indices = list(dataset.indices) if isinstance(dataset, Subset) else list(range(len(base_dataset)))
+    if not isinstance(base_dataset, DetectionDataset):
+        raise TypeError("--balanced_sampling requires DetectionDataset or Subset[DetectionDataset].")
+
+    class_names = list(CLASS_TO_IDX.keys())
+    weights = []
+    for image_idx in indices:
+        image_info = base_dataset.images[image_idx]
+        anns = base_dataset.annotations.get(image_info["id"], [])
+        present_classes = {CLASS_TO_IDX[ann["class"]] for ann in anns}
+        if present_classes:
+            sample_weight = max(sampler_class_weights[class_idx] for class_idx in present_classes)
+        else:
+            sample_weight = 0.5
+        weights.append(float(sample_weight))
+
+    print(
+        "Balanced sampler enabled with class weights: "
+        + ", ".join(f"{name}={sampler_class_weights[idx]}" for idx, name in enumerate(class_names))
+    )
+    return WeightedRandomSampler(torch.tensor(weights, dtype=torch.double), num_samples=len(weights), replacement=True)
+
+
+def compute_detection_priors(dataset: DetectionDataset | Subset, image_size: int) -> tuple[list[float], list[float]]:
+    base_dataset = dataset.dataset if isinstance(dataset, Subset) else dataset
+    indices = list(dataset.indices) if isinstance(dataset, Subset) else list(range(len(base_dataset)))
+    if not isinstance(base_dataset, DetectionDataset):
+        raise TypeError("--data_bias_init requires DetectionDataset or Subset[DetectionDataset].")
+
+    class_counts = torch.ones(len(CLASS_TO_IDX), dtype=torch.float32)
+    scale_counts = torch.ones(3, dtype=torch.float32)
+    strides = (8, 16, 32)
+
+    for image_idx in indices:
+        image_info = base_dataset.images[image_idx]
+        scale = min(image_size / float(image_info["width"]), image_size / float(image_info["height"]))
+        for ann in base_dataset.annotations.get(image_info["id"], []):
+            class_idx = CLASS_TO_IDX[ann["class"]]
+            class_counts[class_idx] += 1.0
+            x1, y1, x2, y2 = [float(value) for value in ann["bbox"]]
+            width = max(0.0, x2 - x1) * scale
+            height = max(0.0, y2 - y1) * scale
+            size = (max(width * height, 1.0)) ** 0.5
+            scale_factor = image_size / 512.0
+            if size < 64 * scale_factor:
+                scale_counts[0] += 1.0
+            elif size < 160 * scale_factor:
+                scale_counts[1] += 1.0
+            else:
+                scale_counts[2] += 1.0
+
+    class_priors = (class_counts / class_counts.sum()).clamp(1e-4, 1.0 - 1e-4)
+    objectness_priors = []
+    num_images = max(len(indices), 1)
+    for scale_count, stride in zip(scale_counts, strides):
+        cells_per_image = max((image_size // stride) ** 2, 1)
+        prior = float((scale_count / (num_images * cells_per_image)).clamp(1e-4, 0.05).item())
+        objectness_priors.append(prior)
+
+    print("Data bias init class priors:", [round(float(value), 6) for value in class_priors])
+    print("Data bias init objectness priors:", [round(value, 6) for value in objectness_priors])
+    return [float(value) for value in class_priors], objectness_priors
 
 
 def move_batch_to_device(batch: dict, device: torch.device) -> dict:
@@ -171,8 +245,16 @@ def save_checkpoint(
         "assign_radius": args.assign_radius,
         "focal_gamma": args.focal_gamma,
         "focal_alpha": args.focal_alpha,
+        "box_loss": args.box_loss,
         "class_weights": class_weights,
+        "balanced_sampling": args.balanced_sampling,
+        "sampler_class_weights": args.sampler_class_weights,
+        "data_bias_init": args.data_bias_init,
     }
+    if hasattr(args, "class_priors"):
+        checkpoint["class_priors"] = args.class_priors
+    if hasattr(args, "objectness_priors"):
+        checkpoint["objectness_priors"] = args.objectness_priors
     if ema_model is not None:
         checkpoint["ema_model"] = ema_model.ema.state_dict() if isinstance(ema_model, ModelEMA) else ema_model.state_dict()
         if isinstance(ema_model, ModelEMA):
@@ -202,7 +284,9 @@ def append_experiment_log(path: Path, args: argparse.Namespace, best_score: dict
         f"- Epochs: {args.epochs}",
         f"- Optimizer: AdamW lr={args.lr}, weight_decay={args.weight_decay}",
         f"- Assignment: center radius={args.assign_radius}",
-        f"- Loss: focal_gamma={args.focal_gamma}, focal_alpha={args.focal_alpha}, class_weights={args.class_weights}",
+        f"- Loss: box_loss={args.box_loss}, focal_gamma={args.focal_gamma}, focal_alpha={args.focal_alpha}, class_weights={args.class_weights}",
+        f"- Balanced sampling: enabled={args.balanced_sampling}, sampler_class_weights={args.sampler_class_weights}",
+        f"- Data bias init: enabled={args.data_bias_init}",
         f"- Inference: conf_threshold={args.conf_threshold}, nms_iou={args.nms_iou}, max_detections={args.max_detections}",
         f"- Best epoch: {best_epoch}",
         f"- Checkpoint: {checkpoint_path.as_posix()}",
@@ -221,6 +305,7 @@ def main() -> None:
     args = parse_args()
     torch.manual_seed(42)
     class_weights = parse_class_weights(args.class_weights)
+    sampler_class_weights = parse_class_weights(args.sampler_class_weights)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint_dir = Path(args.checkpoint_dir)
@@ -240,10 +325,19 @@ def main() -> None:
     if args.limit_val > 0:
         val_dataset = Subset(val_dataset, range(min(args.limit_val, len(val_dataset))))
 
+    class_priors = None
+    objectness_priors = None
+    if args.data_bias_init and resume_checkpoint is None:
+        class_priors, objectness_priors = compute_detection_priors(train_dataset, args.image_size)
+        args.class_priors = class_priors
+        args.objectness_priors = objectness_priors
+
+    train_sampler = make_balanced_sampler(train_dataset, sampler_class_weights) if args.balanced_sampling else None
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
         collate_fn=collate_fn,
@@ -263,6 +357,8 @@ def main() -> None:
         neck_variant=args.neck_variant,
         head_variant=args.head_variant,
         use_attention=args.use_attention,
+        class_priors=class_priors,
+        objectness_priors=objectness_priors,
     ).to(device)
     criterion = DetectionLoss(
         num_classes=len(CLASS_TO_IDX),
@@ -271,6 +367,7 @@ def main() -> None:
         focal_gamma=args.focal_gamma,
         focal_alpha=args.focal_alpha,
         class_weights=class_weights,
+        box_loss=args.box_loss,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))

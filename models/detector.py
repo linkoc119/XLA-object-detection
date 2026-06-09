@@ -5,6 +5,11 @@ from torch import nn
 import torch.nn.functional as F
 
 
+def _logit(value: torch.Tensor | float) -> torch.Tensor:
+    tensor = torch.as_tensor(value, dtype=torch.float32).clamp(1e-4, 1.0 - 1e-4)
+    return torch.log(tensor / (1.0 - tensor))
+
+
 class ConvBNAct(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3, stride: int = 1):
         super().__init__()
@@ -168,9 +173,17 @@ class FPNPAN(nn.Module):
 
 
 class DetectionHead(nn.Module):
-    def __init__(self, channels: int, num_classes: int):
+    def __init__(
+        self,
+        channels: int,
+        num_classes: int,
+        class_priors: list[float] | tuple[float, ...] | torch.Tensor | None = None,
+        objectness_priors: list[float] | tuple[float, ...] | torch.Tensor | None = None,
+    ):
         super().__init__()
         self.num_classes = num_classes
+        self.class_priors = None if class_priors is None else torch.as_tensor(class_priors, dtype=torch.float32)
+        self.objectness_priors = None if objectness_priors is None else torch.as_tensor(objectness_priors, dtype=torch.float32)
         out_channels = 5 + num_classes
         self.heads = nn.ModuleList(
             [
@@ -185,12 +198,16 @@ class DetectionHead(nn.Module):
         self._init_bias()
 
     def _init_bias(self) -> None:
-        for head in self.heads:
+        class_bias = _logit(self.class_priors) if self.class_priors is not None else torch.full((self.num_classes,), -2.0)
+        for scale_idx, head in enumerate(self.heads):
             conv = head[-1]
             if isinstance(conv, nn.Conv2d) and conv.bias is not None:
-                nn.init.constant_(conv.bias[0], -4.0)
+                obj_bias = -4.0
+                if self.objectness_priors is not None:
+                    obj_bias = float(_logit(self.objectness_priors[scale_idx]).item())
+                nn.init.constant_(conv.bias[0], obj_bias)
                 nn.init.constant_(conv.bias[1 : 5], 1.0)
-                nn.init.constant_(conv.bias[5:], -2.0)
+                conv.bias.data[5:].copy_(class_bias.to(conv.bias.device))
 
     def forward(self, features: list[torch.Tensor]) -> list[torch.Tensor]:
         return [head(feature) for head, feature in zip(self.heads, features)]
@@ -199,9 +216,17 @@ class DetectionHead(nn.Module):
 class DecoupledDetectionHead(nn.Module):
     """YOLO-style decoupled regression/objectness and classification head."""
 
-    def __init__(self, channels: int, num_classes: int):
+    def __init__(
+        self,
+        channels: int,
+        num_classes: int,
+        class_priors: list[float] | tuple[float, ...] | torch.Tensor | None = None,
+        objectness_priors: list[float] | tuple[float, ...] | torch.Tensor | None = None,
+    ):
         super().__init__()
         self.num_classes = num_classes
+        self.class_priors = None if class_priors is None else torch.as_tensor(class_priors, dtype=torch.float32)
+        self.objectness_priors = None if objectness_priors is None else torch.as_tensor(objectness_priors, dtype=torch.float32)
         self.reg_heads = nn.ModuleList(
             [
                 nn.Sequential(
@@ -226,14 +251,18 @@ class DecoupledDetectionHead(nn.Module):
         self._init_bias()
 
     def _init_bias(self) -> None:
-        for reg_head, cls_head in zip(self.reg_heads, self.cls_heads):
+        class_bias = _logit(self.class_priors) if self.class_priors is not None else torch.full((self.num_classes,), -2.0)
+        for scale_idx, (reg_head, cls_head) in enumerate(zip(self.reg_heads, self.cls_heads)):
             reg_conv = reg_head[-1]
             cls_conv = cls_head[-1]
             if isinstance(reg_conv, nn.Conv2d) and reg_conv.bias is not None:
-                nn.init.constant_(reg_conv.bias[0], -4.0)
+                obj_bias = -4.0
+                if self.objectness_priors is not None:
+                    obj_bias = float(_logit(self.objectness_priors[scale_idx]).item())
+                nn.init.constant_(reg_conv.bias[0], obj_bias)
                 nn.init.constant_(reg_conv.bias[1:5], 1.0)
             if isinstance(cls_conv, nn.Conv2d) and cls_conv.bias is not None:
-                nn.init.constant_(cls_conv.bias, -2.0)
+                cls_conv.bias.data.copy_(class_bias.to(cls_conv.bias.device))
 
     def forward(self, features: list[torch.Tensor]) -> list[torch.Tensor]:
         outputs = []
@@ -255,6 +284,8 @@ class YoloResNet50(nn.Module):
         neck_variant: str = "baseline",
         head_variant: str = "coupled",
         use_attention: bool = False,
+        class_priors: list[float] | tuple[float, ...] | torch.Tensor | None = None,
+        objectness_priors: list[float] | tuple[float, ...] | torch.Tensor | None = None,
     ):
         super().__init__()
         if head_variant not in {"coupled", "decoupled"}:
@@ -263,9 +294,9 @@ class YoloResNet50(nn.Module):
         self.backbone = ResNet50Backbone(pretrained=pretrained_backbone)
         self.neck = FPNPAN(neck_channels, neck_variant=neck_variant, use_attention=use_attention)
         if head_variant == "decoupled":
-            self.head = DecoupledDetectionHead(neck_channels, num_classes)
+            self.head = DecoupledDetectionHead(neck_channels, num_classes, class_priors=class_priors, objectness_priors=objectness_priors)
         else:
-            self.head = DetectionHead(neck_channels, num_classes)
+            self.head = DetectionHead(neck_channels, num_classes, class_priors=class_priors, objectness_priors=objectness_priors)
 
     def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
         return self.head(self.neck(self.backbone(x)))
