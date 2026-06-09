@@ -75,18 +75,32 @@ class ModelEMA:
     def __init__(self, model: torch.nn.Module, decay: float):
         self.ema = copy.deepcopy(model).eval()
         self.decay = decay
+        self.updates = 0
         for parameter in self.ema.parameters():
             parameter.requires_grad_(False)
 
     @torch.no_grad()
     def update(self, model: torch.nn.Module) -> None:
+        self.updates += 1
+        decay = min(self.decay, (1.0 + self.updates) / (10.0 + self.updates))
         model_state = model.state_dict()
         for name, ema_value in self.ema.state_dict().items():
             model_value = model_state[name].detach()
             if ema_value.dtype.is_floating_point:
-                ema_value.mul_(self.decay).add_(model_value, alpha=1.0 - self.decay)
+                ema_value.mul_(decay).add_(model_value, alpha=1.0 - decay)
             else:
                 ema_value.copy_(model_value)
+
+    def state_dict(self) -> dict[str, object]:
+        return {"model": self.ema.state_dict(), "updates": self.updates, "decay": self.decay}
+
+    def load_state_dict(self, state: dict[str, object]) -> None:
+        if "model" in state:
+            self.ema.load_state_dict(state["model"])
+            self.updates = int(state.get("updates", 0))
+            self.decay = float(state.get("decay", self.decay))
+        else:
+            self.ema.load_state_dict(state)
 
 
 @torch.no_grad()
@@ -157,7 +171,9 @@ def save_checkpoint(
         "class_weights": class_weights,
     }
     if ema_model is not None:
-        checkpoint["ema_model"] = ema_model.state_dict()
+        checkpoint["ema_model"] = ema_model.ema.state_dict() if isinstance(ema_model, ModelEMA) else ema_model.state_dict()
+        if isinstance(ema_model, ModelEMA):
+            checkpoint["ema"] = ema_model.state_dict()
     torch.save(
         checkpoint,
         path,
@@ -270,7 +286,7 @@ def main() -> None:
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint.get("optimizer", optimizer.state_dict()))
         if ema is not None and "ema_model" in checkpoint:
-            ema.ema.load_state_dict(checkpoint["ema_model"])
+            ema.load_state_dict(checkpoint.get("ema", checkpoint["ema_model"]))
         start_epoch = int(checkpoint.get("epoch", 0)) + 1
         best_map = float(checkpoint.get("best_map", -1.0))
 
@@ -297,7 +313,7 @@ def main() -> None:
             progress.set_postfix({key: f"{running[key] / step:.4f}" for key in ("loss", "obj_loss", "cls_loss", "box_loss")})
         scheduler.step()
         eval_model = ema.ema if ema is not None else model
-        save_checkpoint(last_path, model, optimizer, epoch, best_map, args, class_weights, ema_model=eval_model if ema is not None else None)
+        save_checkpoint(last_path, model, optimizer, epoch, best_map, args, class_weights, ema_model=ema)
         print(f"Saved latest checkpoint to {last_path}")
 
         if epoch % args.val_every == 0 or epoch == args.epochs:
@@ -319,7 +335,7 @@ def main() -> None:
                 best_map = current_map
                 best_epoch = epoch
                 best_score = score
-                save_checkpoint(best_path, model, optimizer, epoch, best_map, args, class_weights, ema_model=eval_model if ema is not None else None)
+                save_checkpoint(best_path, model, optimizer, epoch, best_map, args, class_weights, ema_model=ema)
                 print(f"Saved best checkpoint to {best_path}")
 
     append_experiment_log(Path(args.experiment_log), args, best_score, best_epoch, best_path)
