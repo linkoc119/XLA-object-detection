@@ -30,6 +30,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--image_size", type=int, default=512)
     parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--backbone_lr_mult", type=float, default=1.0)
+    parser.add_argument("--freeze_backbone", action="store_true")
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--val_every", type=int, default=1)
@@ -148,6 +150,29 @@ def move_batch_to_device(batch: dict, device: torch.device) -> dict:
     return batch
 
 
+def build_optimizer(model: YoloResNet50, lr: float, weight_decay: float, backbone_lr_mult: float) -> torch.optim.Optimizer:
+    if backbone_lr_mult < 0:
+        raise ValueError("--backbone_lr_mult must be non-negative.")
+    if backbone_lr_mult == 1.0:
+        return torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=lr, weight_decay=weight_decay)
+
+    backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
+    head_params = [
+        p
+        for name, p in model.named_parameters()
+        if p.requires_grad and not name.startswith("backbone.")
+    ]
+    param_groups = []
+    if backbone_params and backbone_lr_mult > 0:
+        param_groups.append({"params": backbone_params, "lr": lr * backbone_lr_mult})
+    if head_params:
+        param_groups.append({"params": head_params, "lr": lr})
+    if not param_groups:
+        raise ValueError("No trainable parameters found.")
+    print(f"Optimizer param groups: backbone_lr={lr * backbone_lr_mult:g}, neck_head_lr={lr:g}")
+    return torch.optim.AdamW(param_groups, lr=lr, weight_decay=weight_decay)
+
+
 class ModelEMA:
     def __init__(self, model: torch.nn.Module, decay: float):
         self.ema = copy.deepcopy(model).eval()
@@ -236,6 +261,9 @@ def save_checkpoint(
         "image_size": args.image_size,
         "conf_threshold": args.conf_threshold,
         "nms_iou": args.nms_iou,
+        "lr": args.lr,
+        "backbone_lr_mult": args.backbone_lr_mult,
+        "freeze_backbone": args.freeze_backbone,
         "architecture": "YoloResNet50",
         "neck_variant": args.neck_variant,
         "head_variant": args.head_variant,
@@ -282,7 +310,7 @@ def append_experiment_log(path: Path, args: argparse.Namespace, best_score: dict
         f"- Image size: {args.image_size}",
         f"- Batch size: {args.batch_size}",
         f"- Epochs: {args.epochs}",
-        f"- Optimizer: AdamW lr={args.lr}, weight_decay={args.weight_decay}",
+        f"- Optimizer: AdamW lr={args.lr}, backbone_lr_mult={args.backbone_lr_mult}, freeze_backbone={args.freeze_backbone}, weight_decay={args.weight_decay}",
         f"- Assignment: center radius={args.assign_radius}",
         f"- Loss: box_loss={args.box_loss}, focal_gamma={args.focal_gamma}, focal_alpha={args.focal_alpha}, class_weights={args.class_weights}",
         f"- Balanced sampling: enabled={args.balanced_sampling}, sampler_class_weights={args.sampler_class_weights}",
@@ -360,6 +388,10 @@ def main() -> None:
         class_priors=class_priors,
         objectness_priors=objectness_priors,
     ).to(device)
+    if args.freeze_backbone:
+        for parameter in model.backbone.parameters():
+            parameter.requires_grad_(False)
+        print("Backbone frozen; training neck/head only.")
     criterion = DetectionLoss(
         num_classes=len(CLASS_TO_IDX),
         image_size=args.image_size,
@@ -369,7 +401,7 @@ def main() -> None:
         class_weights=class_weights,
         box_loss=args.box_loss,
     ).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = build_optimizer(model, args.lr, args.weight_decay, args.backbone_lr_mult)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
     scaler = torch.amp.GradScaler("cuda", enabled=torch.cuda.is_available())
     ema = None if args.no_ema else ModelEMA(model, decay=args.ema_decay)
@@ -385,7 +417,13 @@ def main() -> None:
         checkpoint = resume_checkpoint
         model.load_state_dict(checkpoint["model"])
         if not args.reset_optimizer:
-            optimizer.load_state_dict(checkpoint.get("optimizer", optimizer.state_dict()))
+            try:
+                optimizer.load_state_dict(checkpoint.get("optimizer", optimizer.state_dict()))
+            except ValueError as exc:
+                raise ValueError(
+                    "Optimizer state in checkpoint is incompatible with current optimizer groups. "
+                    "Use --reset_optimizer when changing --backbone_lr_mult or --freeze_backbone."
+                ) from exc
         if ema is not None and "ema_model" in checkpoint:
             ema.load_state_dict(checkpoint.get("ema", checkpoint["ema_model"]))
         start_epoch = int(checkpoint.get("epoch", 0)) + 1
