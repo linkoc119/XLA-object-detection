@@ -41,6 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--neck_variant", choices=["baseline", "csp"], default="baseline")
     parser.add_argument("--head_variant", choices=["coupled", "decoupled"], default="coupled")
     parser.add_argument("--use_attention", action="store_true")
+    parser.add_argument("--use_p2", action="store_true", help="Add a stride-4 P2 detection scale for small objects.")
     parser.add_argument("--ema_decay", type=float, default=0.9998)
     parser.add_argument("--use_ema", action="store_false", dest="no_ema")
     parser.add_argument("--no_ema", action="store_true")
@@ -101,15 +102,31 @@ def make_balanced_sampler(dataset: DetectionDataset | Subset, sampler_class_weig
     return WeightedRandomSampler(torch.tensor(weights, dtype=torch.double), num_samples=len(weights), replacement=True)
 
 
-def compute_detection_priors(dataset: DetectionDataset | Subset, image_size: int) -> tuple[list[float], list[float]]:
+def assign_scale_index_for_size(size: float, image_size: int, num_scales: int) -> int:
+    scale_factor = image_size / 512.0
+    if num_scales == 4:
+        if size < 32 * scale_factor:
+            return 0
+        if size < 80 * scale_factor:
+            return 1
+        if size < 160 * scale_factor:
+            return 2
+        return 3
+    if size < 64 * scale_factor:
+        return 0
+    if size < 160 * scale_factor:
+        return 1
+    return 2
+
+
+def compute_detection_priors(dataset: DetectionDataset | Subset, image_size: int, strides: tuple[int, ...]) -> tuple[list[float], list[float]]:
     base_dataset = dataset.dataset if isinstance(dataset, Subset) else dataset
     indices = list(dataset.indices) if isinstance(dataset, Subset) else list(range(len(base_dataset)))
     if not isinstance(base_dataset, DetectionDataset):
         raise TypeError("--data_bias_init requires DetectionDataset or Subset[DetectionDataset].")
 
     class_counts = torch.ones(len(CLASS_TO_IDX), dtype=torch.float32)
-    scale_counts = torch.ones(3, dtype=torch.float32)
-    strides = (8, 16, 32)
+    scale_counts = torch.ones(len(strides), dtype=torch.float32)
 
     for image_idx in indices:
         image_info = base_dataset.images[image_idx]
@@ -121,13 +138,7 @@ def compute_detection_priors(dataset: DetectionDataset | Subset, image_size: int
             width = max(0.0, x2 - x1) * scale
             height = max(0.0, y2 - y1) * scale
             size = (max(width * height, 1.0)) ** 0.5
-            scale_factor = image_size / 512.0
-            if size < 64 * scale_factor:
-                scale_counts[0] += 1.0
-            elif size < 160 * scale_factor:
-                scale_counts[1] += 1.0
-            else:
-                scale_counts[2] += 1.0
+            scale_counts[assign_scale_index_for_size(size, image_size, len(strides))] += 1.0
 
     class_priors = (class_counts / class_counts.sum()).clamp(1e-4, 1.0 - 1e-4)
     objectness_priors = []
@@ -215,6 +226,7 @@ def validate(
     conf_threshold: float,
     nms_iou: float,
     max_detections: int,
+    strides: tuple[int, ...],
 ) -> tuple[list[dict], dict]:
     model.eval()
     predictions: list[dict] = []
@@ -231,6 +243,7 @@ def validate(
             conf_threshold=conf_threshold,
             nms_iou=nms_iou,
             max_detections=max_detections,
+            strides=strides,
         )
         for image_id, boxes in zip(batch["image_ids"], decoded):
             predictions.append({"image_id": image_id, "boxes": boxes})
@@ -268,6 +281,7 @@ def save_checkpoint(
         "neck_variant": args.neck_variant,
         "head_variant": args.head_variant,
         "use_attention": args.use_attention,
+        "use_p2": args.use_p2,
         "use_ema": not args.no_ema,
         "ema_decay": args.ema_decay,
         "assign_radius": args.assign_radius,
@@ -306,6 +320,7 @@ def append_experiment_log(path: Path, args: argparse.Namespace, best_score: dict
         + (" disabled" if args.no_pretrained_backbone else " enabled"),
         "- Architecture: ResNet-50 C3/C4/C5 + custom FPN/PAN + SPPF + anchor-free head",
         f"- Neck/head: neck_variant={args.neck_variant}, head_variant={args.head_variant}, use_attention={args.use_attention}",
+        f"- P2 scale: enabled={args.use_p2}",
         f"- EMA: enabled={not args.no_ema}, decay={args.ema_decay}",
         f"- Image size: {args.image_size}",
         f"- Batch size: {args.batch_size}",
@@ -345,6 +360,7 @@ def main() -> None:
         args.neck_variant = resume_checkpoint.get("neck_variant", "baseline")
         args.head_variant = resume_checkpoint.get("head_variant", "coupled")
         args.use_attention = bool(resume_checkpoint.get("use_attention", False))
+        args.use_p2 = bool(resume_checkpoint.get("use_p2", False))
 
     train_dataset = DetectionDataset(args.train_data, args.image_dir, image_size=args.image_size, train=True)
     val_dataset = DetectionDataset(args.val_data, args.val_image_dir, image_size=args.image_size, train=False)
@@ -356,7 +372,8 @@ def main() -> None:
     class_priors = None
     objectness_priors = None
     if args.data_bias_init and resume_checkpoint is None:
-        class_priors, objectness_priors = compute_detection_priors(train_dataset, args.image_size)
+        init_strides = (4, 8, 16, 32) if args.use_p2 else (8, 16, 32)
+        class_priors, objectness_priors = compute_detection_priors(train_dataset, args.image_size, init_strides)
         args.class_priors = class_priors
         args.objectness_priors = objectness_priors
 
@@ -385,6 +402,7 @@ def main() -> None:
         neck_variant=args.neck_variant,
         head_variant=args.head_variant,
         use_attention=args.use_attention,
+        use_p2=args.use_p2,
         class_priors=class_priors,
         objectness_priors=objectness_priors,
     ).to(device)
@@ -395,6 +413,7 @@ def main() -> None:
     criterion = DetectionLoss(
         num_classes=len(CLASS_TO_IDX),
         image_size=args.image_size,
+        strides=model.strides,
         assign_radius=args.assign_radius,
         focal_gamma=args.focal_gamma,
         focal_alpha=args.focal_alpha,
@@ -465,6 +484,7 @@ def main() -> None:
                 conf_threshold=args.conf_threshold,
                 nms_iou=args.nms_iou,
                 max_detections=args.max_detections,
+                strides=model.strides,
             )
             save_json(checkpoint_dir / "val_predictions.json", val_predictions)
             save_json(checkpoint_dir / "val_score.json", score)

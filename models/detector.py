@@ -104,8 +104,9 @@ class SPPF(nn.Module):
 
 
 class ResNet50Backbone(nn.Module):
-    def __init__(self, pretrained: bool = True):
+    def __init__(self, pretrained: bool = True, return_p2: bool = False):
         super().__init__()
+        self.return_p2 = return_p2
         try:
             from torchvision.models import ResNet50_Weights, resnet50
         except ImportError as exc:
@@ -122,33 +123,44 @@ class ResNet50Backbone(nn.Module):
         self.layer3 = base.layer3
         self.layer4 = base.layer4
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
         x = self.stem(x)
-        x = self.layer1(x)
-        c3 = self.layer2(x)
+        c2 = self.layer1(x)
+        c3 = self.layer2(c2)
         c4 = self.layer3(c3)
         c5 = self.layer4(c4)
+        if self.return_p2:
+            return c2, c3, c4, c5
         return c3, c4, c5
 
 
 class FPNPAN(nn.Module):
-    def __init__(self, channels: int = 256, neck_variant: str = "baseline", use_attention: bool = False):
+    def __init__(self, channels: int = 256, neck_variant: str = "baseline", use_attention: bool = False, use_p2: bool = False):
         super().__init__()
         if neck_variant not in {"baseline", "csp"}:
             raise ValueError("neck_variant must be 'baseline' or 'csp'.")
         self.neck_variant = neck_variant
         self.use_attention = use_attention
+        self.use_p2 = use_p2
+        if use_p2:
+            self.lat2 = ConvBNAct(256, channels, 1)
         self.lat3 = ConvBNAct(512, channels, 1)
         self.lat4 = ConvBNAct(1024, channels, 1)
         self.sppf = SPPF(2048, channels)
 
         self.fpn4 = self._fusion_block(channels * 2, channels)
         self.fpn3 = self._fusion_block(channels * 2, channels)
+        if use_p2:
+            self.fpn2 = self._fusion_block(channels * 2, channels)
 
+        if use_p2:
+            self.down2 = ConvBNAct(channels, channels, 3, stride=2)
+            self.pan3 = self._fusion_block(channels * 2, channels)
         self.down3 = ConvBNAct(channels, channels, 3, stride=2)
         self.pan4 = self._fusion_block(channels * 2, channels)
         self.down4 = ConvBNAct(channels, channels, 3, stride=2)
         self.pan5 = self._fusion_block(channels * 2, channels)
+        self.attn2 = PartialSpatialAttention(channels) if use_attention and use_p2 else nn.Identity()
         self.attn3 = PartialSpatialAttention(channels) if use_attention else nn.Identity()
         self.attn4 = PartialSpatialAttention(channels) if use_attention else nn.Identity()
         self.attn5 = PartialSpatialAttention(channels) if use_attention else nn.Identity()
@@ -158,14 +170,25 @@ class FPNPAN(nn.Module):
             return nn.Sequential(ConvBNAct(in_channels, out_channels, 3), ResidualBlock(out_channels))
         return nn.Sequential(ConvBNAct(in_channels, out_channels, 3), CSPBlock(out_channels, num_blocks=2))
 
-    def forward(self, features: tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> list[torch.Tensor]:
-        c3, c4, c5 = features
+    def forward(self, features: tuple[torch.Tensor, ...]) -> list[torch.Tensor]:
+        if self.use_p2:
+            c2, c3, c4, c5 = features
+        else:
+            c3, c4, c5 = features
         p5 = self.sppf(c5)
         p4 = self.lat4(c4)
         p3 = self.lat3(c3)
 
         p4 = self.fpn4(torch.cat([p4, F.interpolate(p5, size=p4.shape[-2:], mode="nearest")], dim=1))
         p3 = self.fpn3(torch.cat([p3, F.interpolate(p4, size=p3.shape[-2:], mode="nearest")], dim=1))
+
+        if self.use_p2:
+            p2 = self.lat2(c2)
+            p2 = self.fpn2(torch.cat([p2, F.interpolate(p3, size=p2.shape[-2:], mode="nearest")], dim=1))
+            n3 = self.pan3(torch.cat([self.down2(p2), p3], dim=1))
+            n4 = self.pan4(torch.cat([self.down3(n3), p4], dim=1))
+            n5 = self.pan5(torch.cat([self.down4(n4), p5], dim=1))
+            return [self.attn2(p2), self.attn3(n3), self.attn4(n4), self.attn5(n5)]
 
         n4 = self.pan4(torch.cat([self.down3(p3), p4], dim=1))
         n5 = self.pan5(torch.cat([self.down4(n4), p5], dim=1))
@@ -179,6 +202,7 @@ class DetectionHead(nn.Module):
         num_classes: int,
         class_priors: list[float] | tuple[float, ...] | torch.Tensor | None = None,
         objectness_priors: list[float] | tuple[float, ...] | torch.Tensor | None = None,
+        num_scales: int = 3,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -192,7 +216,7 @@ class DetectionHead(nn.Module):
                     ConvBNAct(channels, channels, 3),
                     nn.Conv2d(channels, out_channels, 1),
                 )
-                for _ in range(3)
+                for _ in range(num_scales)
             ]
         )
         self._init_bias()
@@ -222,6 +246,7 @@ class DecoupledDetectionHead(nn.Module):
         num_classes: int,
         class_priors: list[float] | tuple[float, ...] | torch.Tensor | None = None,
         objectness_priors: list[float] | tuple[float, ...] | torch.Tensor | None = None,
+        num_scales: int = 3,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -234,7 +259,7 @@ class DecoupledDetectionHead(nn.Module):
                     ConvBNAct(channels, channels, 3),
                     nn.Conv2d(channels, 5, 1),
                 )
-                for _ in range(3)
+                for _ in range(num_scales)
             ]
         )
         cls_channels = max(96, channels // 2)
@@ -245,7 +270,7 @@ class DecoupledDetectionHead(nn.Module):
                     ConvBNAct(cls_channels, cls_channels, 3),
                     nn.Conv2d(cls_channels, num_classes, 1),
                 )
-                for _ in range(3)
+                for _ in range(num_scales)
             ]
         )
         self._init_bias()
@@ -284,6 +309,7 @@ class YoloResNet50(nn.Module):
         neck_variant: str = "baseline",
         head_variant: str = "coupled",
         use_attention: bool = False,
+        use_p2: bool = False,
         class_priors: list[float] | tuple[float, ...] | torch.Tensor | None = None,
         objectness_priors: list[float] | tuple[float, ...] | torch.Tensor | None = None,
     ):
@@ -291,12 +317,27 @@ class YoloResNet50(nn.Module):
         if head_variant not in {"coupled", "decoupled"}:
             raise ValueError("head_variant must be 'coupled' or 'decoupled'.")
         self.num_classes = num_classes
-        self.backbone = ResNet50Backbone(pretrained=pretrained_backbone)
-        self.neck = FPNPAN(neck_channels, neck_variant=neck_variant, use_attention=use_attention)
+        self.use_p2 = use_p2
+        self.strides = (4, 8, 16, 32) if use_p2 else (8, 16, 32)
+        num_scales = len(self.strides)
+        self.backbone = ResNet50Backbone(pretrained=pretrained_backbone, return_p2=use_p2)
+        self.neck = FPNPAN(neck_channels, neck_variant=neck_variant, use_attention=use_attention, use_p2=use_p2)
         if head_variant == "decoupled":
-            self.head = DecoupledDetectionHead(neck_channels, num_classes, class_priors=class_priors, objectness_priors=objectness_priors)
+            self.head = DecoupledDetectionHead(
+                neck_channels,
+                num_classes,
+                class_priors=class_priors,
+                objectness_priors=objectness_priors,
+                num_scales=num_scales,
+            )
         else:
-            self.head = DetectionHead(neck_channels, num_classes, class_priors=class_priors, objectness_priors=objectness_priors)
+            self.head = DetectionHead(
+                neck_channels,
+                num_classes,
+                class_priors=class_priors,
+                objectness_priors=objectness_priors,
+                num_scales=num_scales,
+            )
 
     def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
         return self.head(self.neck(self.backbone(x)))

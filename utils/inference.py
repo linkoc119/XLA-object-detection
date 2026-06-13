@@ -18,7 +18,7 @@ def decode_outputs(
     conf_threshold: float = 0.25,
     nms_iou: float = 0.5,
     max_detections: int = 100,
-    strides: tuple[int, int, int] = (8, 16, 32),
+    strides: tuple[int, ...] = (8, 16, 32),
     flip_horizontal: bool = False,
 ) -> list[list[dict[str, object]]]:
     batch_size = outputs[0].shape[0]

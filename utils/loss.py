@@ -12,7 +12,7 @@ class DetectionLoss(nn.Module):
         self,
         num_classes: int,
         image_size: int = 512,
-        strides: tuple[int, int, int] = (8, 16, 32),
+        strides: tuple[int, ...] = (8, 16, 32),
         obj_weight: float = 1.0,
         cls_weight: float = 1.0,
         box_weight: float = 5.0,
@@ -45,6 +45,14 @@ class DetectionLoss(nn.Module):
         height = box[3] - box[1]
         size = torch.sqrt((width * height).clamp(min=1.0))
         scale = self.image_size / 512.0
+        if len(self.strides) == 4:
+            if size < 32 * scale:
+                return 0
+            if size < 80 * scale:
+                return 1
+            if size < 160 * scale:
+                return 2
+            return 3
         if size < 64 * scale:
             return 0
         if size < 160 * scale:

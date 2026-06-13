@@ -93,6 +93,7 @@ def main() -> None:
         neck_variant=checkpoint.get("neck_variant", "baseline"),
         head_variant=checkpoint.get("head_variant", "coupled"),
         use_attention=bool(checkpoint.get("use_attention", False)),
+        use_p2=bool(checkpoint.get("use_p2", False)),
     ).to(device)
     checkpoint_key = args.checkpoint_key
     if checkpoint_key == "auto":
@@ -127,6 +128,7 @@ def main() -> None:
                 conf_threshold=conf_threshold,
                 nms_iou=nms_iou,
                 max_detections=args.max_detections,
+                strides=model.strides,
             )
             if args.tta_flip:
                 flip_outputs = model(torch.flip(images, dims=[3]))
@@ -140,6 +142,7 @@ def main() -> None:
                     conf_threshold=conf_threshold,
                     nms_iou=nms_iou,
                     max_detections=args.max_detections,
+                    strides=model.strides,
                     flip_horizontal=True,
                 )
                 decoded = merge_predictions(decoded, decoded_flip, nms_iou=nms_iou, max_detections=args.max_detections)
