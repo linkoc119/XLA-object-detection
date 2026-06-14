@@ -47,10 +47,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_ema", action="store_true")
     parser.set_defaults(no_ema=True)
     parser.add_argument("--assign_radius", type=int, default=1, help="Positive center assignment radius in feature cells. 1 means a 3x3 region.")
+    parser.add_argument("--assign_topk", type=int, default=0, help="Keep only the nearest K positive cells per object. 0 keeps all cells in radius.")
     parser.add_argument("--focal_gamma", type=float, default=2.0)
     parser.add_argument("--focal_alpha", type=float, default=0.25)
+    parser.add_argument("--hard_negative_weight", type=float, default=0.0, help="Extra objectness loss weight for top-scoring negative cells.")
+    parser.add_argument("--hard_negative_topk", type=int, default=128, help="Number of hard negative cells per image and scale.")
+    parser.add_argument("--negative_image_weight", type=float, default=1.0, help="Objectness loss multiplier for images without annotations.")
+    parser.add_argument("--iou_aware_obj", action="store_true", help="Use detached predicted IoU as positive objectness target.")
+    parser.add_argument("--iou_aware_min", type=float, default=0.05, help="Minimum positive target when --iou_aware_obj is enabled.")
     parser.add_argument("--box_loss", choices=["giou", "diou", "ciou"], default="giou")
     parser.add_argument("--balanced_sampling", action="store_true")
+    parser.add_argument("--sampler_negative_weight", type=float, default=0.5, help="Sampling weight for images with no annotations.")
     parser.add_argument("--data_bias_init", action="store_true")
     parser.add_argument(
         "--class_weights",
@@ -67,6 +74,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_pretrained_backbone", action="store_true")
     parser.add_argument("--resume", default=None)
     parser.add_argument("--reset_optimizer", action="store_true", help="When resuming, start with a fresh optimizer and scheduler.")
+    parser.add_argument("--early_stop_patience", type=int, default=0, help="Stop after this many validation rounds without mAP improvement. 0 disables.")
+    parser.add_argument("--early_stop_min_delta", type=float, default=0.0, help="Minimum mAP improvement required to reset early stopping.")
     return parser.parse_args()
 
 
@@ -77,7 +86,11 @@ def parse_class_weights(value: str) -> list[float]:
     return weights
 
 
-def make_balanced_sampler(dataset: DetectionDataset | Subset, sampler_class_weights: list[float]) -> WeightedRandomSampler:
+def make_balanced_sampler(
+    dataset: DetectionDataset | Subset,
+    sampler_class_weights: list[float],
+    negative_weight: float,
+) -> WeightedRandomSampler:
     base_dataset = dataset.dataset if isinstance(dataset, Subset) else dataset
     indices = list(dataset.indices) if isinstance(dataset, Subset) else list(range(len(base_dataset)))
     if not isinstance(base_dataset, DetectionDataset):
@@ -92,12 +105,13 @@ def make_balanced_sampler(dataset: DetectionDataset | Subset, sampler_class_weig
         if present_classes:
             sample_weight = max(sampler_class_weights[class_idx] for class_idx in present_classes)
         else:
-            sample_weight = 0.5
+            sample_weight = negative_weight
         weights.append(float(sample_weight))
 
     print(
         "Balanced sampler enabled with class weights: "
         + ", ".join(f"{name}={sampler_class_weights[idx]}" for idx, name in enumerate(class_names))
+        + f", negative={negative_weight}"
     )
     return WeightedRandomSampler(torch.tensor(weights, dtype=torch.double), num_samples=len(weights), replacement=True)
 
@@ -285,12 +299,19 @@ def save_checkpoint(
         "use_ema": not args.no_ema,
         "ema_decay": args.ema_decay,
         "assign_radius": args.assign_radius,
+        "assign_topk": args.assign_topk,
         "focal_gamma": args.focal_gamma,
         "focal_alpha": args.focal_alpha,
+        "hard_negative_weight": args.hard_negative_weight,
+        "hard_negative_topk": args.hard_negative_topk,
+        "negative_image_weight": args.negative_image_weight,
+        "iou_aware_obj": args.iou_aware_obj,
+        "iou_aware_min": args.iou_aware_min,
         "box_loss": args.box_loss,
         "class_weights": class_weights,
         "balanced_sampling": args.balanced_sampling,
         "sampler_class_weights": args.sampler_class_weights,
+        "sampler_negative_weight": args.sampler_negative_weight,
         "data_bias_init": args.data_bias_init,
     }
     if hasattr(args, "class_priors"):
@@ -326,9 +347,10 @@ def append_experiment_log(path: Path, args: argparse.Namespace, best_score: dict
         f"- Batch size: {args.batch_size}",
         f"- Epochs: {args.epochs}",
         f"- Optimizer: AdamW lr={args.lr}, backbone_lr_mult={args.backbone_lr_mult}, freeze_backbone={args.freeze_backbone}, weight_decay={args.weight_decay}",
-        f"- Assignment: center radius={args.assign_radius}",
+        f"- Assignment: center radius={args.assign_radius}, assign_topk={args.assign_topk}",
         f"- Loss: box_loss={args.box_loss}, focal_gamma={args.focal_gamma}, focal_alpha={args.focal_alpha}, class_weights={args.class_weights}",
-        f"- Balanced sampling: enabled={args.balanced_sampling}, sampler_class_weights={args.sampler_class_weights}",
+        f"- Hard negative/objectness: hard_negative_weight={args.hard_negative_weight}, hard_negative_topk={args.hard_negative_topk}, negative_image_weight={args.negative_image_weight}, iou_aware_obj={args.iou_aware_obj}, iou_aware_min={args.iou_aware_min}",
+        f"- Balanced sampling: enabled={args.balanced_sampling}, sampler_class_weights={args.sampler_class_weights}, sampler_negative_weight={args.sampler_negative_weight}",
         f"- Data bias init: enabled={args.data_bias_init}",
         f"- Inference: conf_threshold={args.conf_threshold}, nms_iou={args.nms_iou}, max_detections={args.max_detections}",
         f"- Best epoch: {best_epoch}",
@@ -377,7 +399,7 @@ def main() -> None:
         args.class_priors = class_priors
         args.objectness_priors = objectness_priors
 
-    train_sampler = make_balanced_sampler(train_dataset, sampler_class_weights) if args.balanced_sampling else None
+    train_sampler = make_balanced_sampler(train_dataset, sampler_class_weights, args.sampler_negative_weight) if args.balanced_sampling else None
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -415,10 +437,16 @@ def main() -> None:
         image_size=args.image_size,
         strides=model.strides,
         assign_radius=args.assign_radius,
+        assign_topk=args.assign_topk,
         focal_gamma=args.focal_gamma,
         focal_alpha=args.focal_alpha,
         class_weights=class_weights,
         box_loss=args.box_loss,
+        hard_negative_weight=args.hard_negative_weight,
+        hard_negative_topk=args.hard_negative_topk,
+        negative_image_weight=args.negative_image_weight,
+        iou_aware_obj=args.iou_aware_obj,
+        iou_aware_min=args.iou_aware_min,
     ).to(device)
     optimizer = build_optimizer(model, args.lr, args.weight_decay, args.backbone_lr_mult)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
@@ -447,7 +475,10 @@ def main() -> None:
             ema.load_state_dict(checkpoint.get("ema", checkpoint["ema_model"]))
         start_epoch = int(checkpoint.get("epoch", 0)) + 1
         best_map = float(checkpoint.get("best_map", -1.0))
+        best_epoch = int(checkpoint.get("epoch", 0))
+        best_score = {"mAP@0.5": best_map}
 
+    rounds_without_improvement = 0
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         running = {"loss": 0.0, "obj_loss": 0.0, "cls_loss": 0.0, "box_loss": 0.0, "num_pos": 0.0}
@@ -490,12 +521,21 @@ def main() -> None:
             save_json(checkpoint_dir / "val_score.json", score)
             current_map = float(score["mAP@0.5"])
             print(f"Epoch {epoch}: val mAP@0.5={current_map:.6f}")
-            if current_map > best_map:
+            if current_map > best_map + args.early_stop_min_delta:
                 best_map = current_map
                 best_epoch = epoch
                 best_score = score
+                rounds_without_improvement = 0
                 save_checkpoint(best_path, model, optimizer, epoch, best_map, args, class_weights, ema_model=ema)
                 print(f"Saved best checkpoint to {best_path}")
+            else:
+                rounds_without_improvement += 1
+                if args.early_stop_patience > 0 and rounds_without_improvement >= args.early_stop_patience:
+                    print(
+                        f"Early stopping after {rounds_without_improvement} validation rounds without "
+                        f"mAP improvement greater than {args.early_stop_min_delta}."
+                    )
+                    break
 
     append_experiment_log(Path(args.experiment_log), args, best_score, best_epoch, best_path)
     print(f"Best mAP@0.5={best_map:.6f} at epoch {best_epoch}")

@@ -4,7 +4,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from .bbox import complete_iou_loss, distance_iou_loss, generalized_iou_loss
+from .bbox import box_iou, complete_iou_loss, distance_iou_loss, generalized_iou_loss
 
 
 class DetectionLoss(nn.Module):
@@ -21,6 +21,12 @@ class DetectionLoss(nn.Module):
         focal_alpha: float = 0.25,
         class_weights: list[float] | tuple[float, ...] | None = None,
         box_loss: str = "giou",
+        assign_topk: int = 0,
+        hard_negative_weight: float = 0.0,
+        hard_negative_topk: int = 128,
+        negative_image_weight: float = 1.0,
+        iou_aware_obj: bool = False,
+        iou_aware_min: float = 0.05,
     ):
         super().__init__()
         if box_loss not in {"giou", "diou", "ciou"}:
@@ -35,6 +41,12 @@ class DetectionLoss(nn.Module):
         self.focal_gamma = focal_gamma
         self.focal_alpha = focal_alpha
         self.box_loss = box_loss
+        self.assign_topk = assign_topk
+        self.hard_negative_weight = hard_negative_weight
+        self.hard_negative_topk = hard_negative_topk
+        self.negative_image_weight = negative_image_weight
+        self.iou_aware_obj = iou_aware_obj
+        self.iou_aware_min = iou_aware_min
         weights = torch.ones(num_classes, dtype=torch.float32) if class_weights is None else torch.tensor(class_weights, dtype=torch.float32)
         if weights.numel() != num_classes:
             raise ValueError(f"class_weights must contain {num_classes} values.")
@@ -65,6 +77,12 @@ class DetectionLoss(nn.Module):
         pt = prob * targets + (1.0 - prob) * (1.0 - targets)
         alpha_t = self.focal_alpha * targets + (1.0 - self.focal_alpha) * (1.0 - targets)
         return alpha_t * (1.0 - pt).pow(self.focal_gamma) * bce
+
+    @staticmethod
+    def _aligned_iou(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        if pred.numel() == 0:
+            return pred.new_zeros((0,))
+        return box_iou(pred, target).diagonal()
 
     @staticmethod
     def _decode_boxes(raw_box: torch.Tensor, stride: int) -> torch.Tensor:
@@ -124,6 +142,7 @@ class DetectionLoss(nn.Module):
                     cy_value = float(cy_float.item())
                     x1, y1, x2, y2 = [float(value.item()) for value in box]
                     area = (box[2] - box[0]).clamp(min=0) * (box[3] - box[1]).clamp(min=0)
+                    candidates: list[tuple[float, int, int]] = []
                     for offset_y in range(-self.assign_radius, self.assign_radius + 1):
                         for offset_x in range(-self.assign_radius, self.assign_radius + 1):
                             gx = int(cx.item()) + offset_x
@@ -136,27 +155,51 @@ class DetectionLoss(nn.Module):
                             near_center = abs(gx + 0.5 - cx_value) <= self.assign_radius + 0.5 and abs(gy + 0.5 - cy_value) <= self.assign_radius + 0.5
                             if not in_box and not near_center:
                                 continue
-                            if area >= area_target[batch_idx, gy, gx]:
-                                continue
-                            area_target[batch_idx, gy, gx] = area
-                            obj_target[batch_idx, gy, gx] = 1.0
-                            cls_target[batch_idx, gy, gx].zero_()
-                            cls_target[batch_idx, gy, gx, class_idx] = 1.0
-                            box_target[batch_idx, gy, gx] = box
-                            pos_mask[batch_idx, gy, gx] = True
+                            distance = (gx + 0.5 - cx_value) ** 2 + (gy + 0.5 - cy_value) ** 2
+                            candidates.append((distance, gx, gy))
+
+                    if self.assign_topk > 0:
+                        candidates = sorted(candidates, key=lambda item: item[0])[: self.assign_topk]
+
+                    for _, gx, gy in candidates:
+                        if area >= area_target[batch_idx, gy, gx]:
+                            continue
+                        area_target[batch_idx, gy, gx] = area
+                        obj_target[batch_idx, gy, gx] = 1.0
+                        cls_target[batch_idx, gy, gx].zero_()
+                        cls_target[batch_idx, gy, gx, class_idx] = 1.0
+                        box_target[batch_idx, gy, gx] = box
+                        pos_mask[batch_idx, gy, gx] = True
 
             obj_logits = output[:, 0]
             raw_box = output[:, 1:5]
             cls_logits = output[:, 5 : 5 + self.num_classes].permute(0, 2, 3, 1)
+            decoded_boxes = self._decode_boxes(raw_box, stride).permute(0, 2, 3, 1)
+
+            if self.iou_aware_obj and pos_mask.any():
+                with torch.no_grad():
+                    pos_iou = self._aligned_iou(decoded_boxes[pos_mask], box_target[pos_mask])
+                    obj_target[pos_mask] = pos_iou.clamp(min=self.iou_aware_min, max=1.0)
 
             obj_loss_map = self._focal_bce(obj_logits, obj_target)
+            if self.negative_image_weight != 1.0:
+                empty_images = torch.tensor([len(sample_labels) == 0 for sample_labels in labels], dtype=torch.bool, device=device)
+                if empty_images.any():
+                    obj_loss_map = obj_loss_map.clone()
+                    obj_loss_map[empty_images] *= self.negative_image_weight
             obj_losses.append(obj_loss_map.mean())
+
+            if self.hard_negative_weight > 0 and self.hard_negative_topk > 0:
+                neg_loss = obj_loss_map.masked_select(~pos_mask)
+                if neg_loss.numel() > 0:
+                    topk = min(self.hard_negative_topk * bsz, neg_loss.numel())
+                    obj_losses.append(neg_loss.topk(topk).values.mean() * self.hard_negative_weight)
 
             if pos_mask.any():
                 cls_loss_map = self._focal_bce(cls_logits[pos_mask], cls_target[pos_mask]).sum(dim=1)
                 target_classes = cls_target[pos_mask].argmax(dim=1)
                 cls_losses.append((cls_loss_map * self.class_weights[target_classes]).mean())
-                pred_boxes = self._decode_boxes(raw_box, stride).permute(0, 2, 3, 1)[pos_mask]
+                pred_boxes = decoded_boxes[pos_mask]
                 tgt_boxes = box_target[pos_mask]
                 l1 = F.smooth_l1_loss(pred_boxes, tgt_boxes)
                 if self.box_loss == "ciou":
