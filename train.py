@@ -32,6 +32,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--backbone_name", choices=["resnet50", "convnextv2_tiny"], default="resnet50")
     parser.add_argument("--backbone_lr_mult", type=float, default=1.0)
+    parser.add_argument("--scheduler", choices=["cosine", "plateau"], default="cosine")
+    parser.add_argument("--warmup_epochs", type=int, default=0)
+    parser.add_argument("--plateau_factor", type=float, default=0.2)
+    parser.add_argument("--plateau_patience", type=int, default=2)
+    parser.add_argument("--min_lr", type=float, default=1e-6)
     parser.add_argument("--freeze_backbone", action="store_true")
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--num_workers", type=int, default=2)
@@ -56,6 +61,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--negative_image_weight", type=float, default=1.0, help="Objectness loss multiplier for images without annotations.")
     parser.add_argument("--iou_aware_obj", action="store_true", help="Use detached predicted IoU as positive objectness target.")
     parser.add_argument("--iou_aware_min", type=float, default=0.05, help="Minimum positive target when --iou_aware_obj is enabled.")
+    parser.add_argument("--reg_max", type=int, default=0, help="Use DFL box regression with bins 0..reg_max. 0 keeps direct box regression.")
+    parser.add_argument("--dfl_weight", type=float, default=0.5)
     parser.add_argument("--box_loss", choices=["giou", "diou", "ciou"], default="giou")
     parser.add_argument("--balanced_sampling", action="store_true")
     parser.add_argument("--sampler_negative_weight", type=float, default=0.5, help="Sampling weight for images with no annotations.")
@@ -242,6 +249,7 @@ def validate(
     nms_iou: float,
     max_detections: int,
     strides: tuple[int, ...],
+    reg_max: int,
 ) -> tuple[list[dict], dict]:
     model.eval()
     predictions: list[dict] = []
@@ -259,6 +267,7 @@ def validate(
             nms_iou=nms_iou,
             max_detections=max_detections,
             strides=strides,
+            reg_max=reg_max,
         )
         for image_id, boxes in zip(batch["image_ids"], decoded):
             predictions.append({"image_id": image_id, "boxes": boxes})
@@ -291,6 +300,11 @@ def save_checkpoint(
         "nms_iou": args.nms_iou,
         "lr": args.lr,
         "backbone_lr_mult": args.backbone_lr_mult,
+        "scheduler": args.scheduler,
+        "warmup_epochs": args.warmup_epochs,
+        "plateau_factor": args.plateau_factor,
+        "plateau_patience": args.plateau_patience,
+        "min_lr": args.min_lr,
         "freeze_backbone": args.freeze_backbone,
         "architecture": "YoloResNet50",
         "backbone_name": args.backbone_name,
@@ -309,6 +323,8 @@ def save_checkpoint(
         "negative_image_weight": args.negative_image_weight,
         "iou_aware_obj": args.iou_aware_obj,
         "iou_aware_min": args.iou_aware_min,
+        "reg_max": args.reg_max,
+        "dfl_weight": args.dfl_weight,
         "box_loss": args.box_loss,
         "class_weights": class_weights,
         "balanced_sampling": args.balanced_sampling,
@@ -349,8 +365,9 @@ def append_experiment_log(path: Path, args: argparse.Namespace, best_score: dict
         f"- Batch size: {args.batch_size}",
         f"- Epochs: {args.epochs}",
         f"- Optimizer: AdamW lr={args.lr}, backbone_lr_mult={args.backbone_lr_mult}, freeze_backbone={args.freeze_backbone}, weight_decay={args.weight_decay}",
+        f"- Scheduler: {args.scheduler}, warmup_epochs={args.warmup_epochs}, plateau_factor={args.plateau_factor}, plateau_patience={args.plateau_patience}, min_lr={args.min_lr}",
         f"- Assignment: center radius={args.assign_radius}, assign_topk={args.assign_topk}",
-        f"- Loss: box_loss={args.box_loss}, focal_gamma={args.focal_gamma}, focal_alpha={args.focal_alpha}, class_weights={args.class_weights}",
+        f"- Loss: box_loss={args.box_loss}, reg_max={args.reg_max}, dfl_weight={args.dfl_weight}, focal_gamma={args.focal_gamma}, focal_alpha={args.focal_alpha}, class_weights={args.class_weights}",
         f"- Hard negative/objectness: hard_negative_weight={args.hard_negative_weight}, hard_negative_topk={args.hard_negative_topk}, negative_image_weight={args.negative_image_weight}, iou_aware_obj={args.iou_aware_obj}, iou_aware_min={args.iou_aware_min}",
         f"- Balanced sampling: enabled={args.balanced_sampling}, sampler_class_weights={args.sampler_class_weights}, sampler_negative_weight={args.sampler_negative_weight}",
         f"- Data bias init: enabled={args.data_bias_init}",
@@ -371,6 +388,7 @@ def append_experiment_log(path: Path, args: argparse.Namespace, best_score: dict
 def main() -> None:
     args = parse_args()
     torch.manual_seed(42)
+    torch.backends.cudnn.benchmark = torch.cuda.is_available()
     class_weights = parse_class_weights(args.class_weights)
     sampler_class_weights = parse_class_weights(args.sampler_class_weights)
 
@@ -386,6 +404,7 @@ def main() -> None:
         args.head_variant = resume_checkpoint.get("head_variant", "coupled")
         args.use_attention = bool(resume_checkpoint.get("use_attention", False))
         args.use_p2 = bool(resume_checkpoint.get("use_p2", False))
+        args.reg_max = int(resume_checkpoint.get("reg_max", 0))
 
     train_dataset = DetectionDataset(args.train_data, args.image_dir, image_size=args.image_size, train=True)
     val_dataset = DetectionDataset(args.val_data, args.val_image_dir, image_size=args.image_size, train=False)
@@ -410,6 +429,7 @@ def main() -> None:
         sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
+        persistent_workers=args.num_workers > 0,
         collate_fn=collate_fn,
     )
     val_loader = DataLoader(
@@ -418,6 +438,7 @@ def main() -> None:
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
+        persistent_workers=args.num_workers > 0,
         collate_fn=collate_fn,
     )
 
@@ -429,6 +450,7 @@ def main() -> None:
         head_variant=args.head_variant,
         use_attention=args.use_attention,
         use_p2=args.use_p2,
+        reg_max=args.reg_max,
         class_priors=class_priors,
         objectness_priors=objectness_priors,
     ).to(device)
@@ -451,9 +473,25 @@ def main() -> None:
         negative_image_weight=args.negative_image_weight,
         iou_aware_obj=args.iou_aware_obj,
         iou_aware_min=args.iou_aware_min,
+        reg_max=args.reg_max,
+        dfl_weight=args.dfl_weight,
     ).to(device)
     optimizer = build_optimizer(model, args.lr, args.weight_decay, args.backbone_lr_mult)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
+    base_lrs = [group["lr"] for group in optimizer.param_groups]
+    if args.scheduler == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="max",
+            factor=args.plateau_factor,
+            patience=args.plateau_patience,
+            min_lr=args.min_lr,
+        )
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(args.epochs - args.warmup_epochs, 1),
+            eta_min=args.min_lr,
+        )
     scaler = torch.amp.GradScaler("cuda", enabled=torch.cuda.is_available())
     ema = None if args.no_ema else ModelEMA(model, decay=args.ema_decay)
 
@@ -484,6 +522,10 @@ def main() -> None:
 
     rounds_without_improvement = 0
     for epoch in range(start_epoch, args.epochs + 1):
+        if args.warmup_epochs > 0 and epoch <= args.warmup_epochs:
+            warmup_scale = max(epoch / args.warmup_epochs, 1e-3)
+            for group, base_lr in zip(optimizer.param_groups, base_lrs):
+                group["lr"] = base_lr * warmup_scale
         model.train()
         running = {"loss": 0.0, "obj_loss": 0.0, "cls_loss": 0.0, "box_loss": 0.0, "num_pos": 0.0}
         progress = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}")
@@ -504,7 +546,6 @@ def main() -> None:
             for key in running:
                 running[key] += metrics[key]
             progress.set_postfix({key: f"{running[key] / step:.4f}" for key in ("loss", "obj_loss", "cls_loss", "box_loss")})
-        scheduler.step()
         eval_model = ema.ema if ema is not None else model
         save_checkpoint(last_path, model, optimizer, epoch, best_map, args, class_weights, ema_model=ema)
         print(f"Saved latest checkpoint to {last_path}")
@@ -520,11 +561,14 @@ def main() -> None:
                 nms_iou=args.nms_iou,
                 max_detections=args.max_detections,
                 strides=model.strides,
+                reg_max=args.reg_max,
             )
             save_json(checkpoint_dir / "val_predictions.json", val_predictions)
             save_json(checkpoint_dir / "val_score.json", score)
             current_map = float(score["mAP@0.5"])
             print(f"Epoch {epoch}: val mAP@0.5={current_map:.6f}")
+            if args.scheduler == "plateau" and epoch > args.warmup_epochs:
+                scheduler.step(current_map)
             if current_map > best_map + args.early_stop_min_delta:
                 best_map = current_map
                 best_epoch = epoch
@@ -540,6 +584,8 @@ def main() -> None:
                         f"mAP improvement greater than {args.early_stop_min_delta}."
                     )
                     break
+        if args.scheduler == "cosine" and epoch > args.warmup_epochs:
+            scheduler.step()
 
     append_experiment_log(Path(args.experiment_log), args, best_score, best_epoch, best_path)
     print(f"Best mAP@0.5={best_map:.6f} at epoch {best_epoch}")

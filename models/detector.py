@@ -268,12 +268,15 @@ class DetectionHead(nn.Module):
         class_priors: list[float] | tuple[float, ...] | torch.Tensor | None = None,
         objectness_priors: list[float] | tuple[float, ...] | torch.Tensor | None = None,
         num_scales: int = 3,
+        reg_max: int = 0,
     ):
         super().__init__()
         self.num_classes = num_classes
+        self.reg_max = reg_max
         self.class_priors = None if class_priors is None else torch.as_tensor(class_priors, dtype=torch.float32)
         self.objectness_priors = None if objectness_priors is None else torch.as_tensor(objectness_priors, dtype=torch.float32)
-        out_channels = 5 + num_classes
+        box_channels = 4 * (reg_max + 1) if reg_max > 0 else 4
+        out_channels = 1 + box_channels + num_classes
         self.heads = nn.ModuleList(
             [
                 nn.Sequential(
@@ -295,8 +298,9 @@ class DetectionHead(nn.Module):
                 if self.objectness_priors is not None:
                     obj_bias = float(_logit(self.objectness_priors[scale_idx]).item())
                 nn.init.constant_(conv.bias[0], obj_bias)
-                nn.init.constant_(conv.bias[1 : 5], 1.0)
-                conv.bias.data[5:].copy_(class_bias.to(conv.bias.device))
+                box_end = 1 + 4 * (self.reg_max + 1) if self.reg_max > 0 else 5
+                nn.init.constant_(conv.bias[1:box_end], 0.0 if self.reg_max > 0 else 1.0)
+                conv.bias.data[box_end:].copy_(class_bias.to(conv.bias.device))
 
     def forward(self, features: list[torch.Tensor]) -> list[torch.Tensor]:
         return [head(feature) for head, feature in zip(self.heads, features)]
@@ -312,17 +316,20 @@ class DecoupledDetectionHead(nn.Module):
         class_priors: list[float] | tuple[float, ...] | torch.Tensor | None = None,
         objectness_priors: list[float] | tuple[float, ...] | torch.Tensor | None = None,
         num_scales: int = 3,
+        reg_max: int = 0,
     ):
         super().__init__()
         self.num_classes = num_classes
+        self.reg_max = reg_max
         self.class_priors = None if class_priors is None else torch.as_tensor(class_priors, dtype=torch.float32)
         self.objectness_priors = None if objectness_priors is None else torch.as_tensor(objectness_priors, dtype=torch.float32)
+        reg_channels = 1 + (4 * (reg_max + 1) if reg_max > 0 else 4)
         self.reg_heads = nn.ModuleList(
             [
                 nn.Sequential(
                     ConvBNAct(channels, channels, 3),
                     ConvBNAct(channels, channels, 3),
-                    nn.Conv2d(channels, 5, 1),
+                    nn.Conv2d(channels, reg_channels, 1),
                 )
                 for _ in range(num_scales)
             ]
@@ -350,7 +357,7 @@ class DecoupledDetectionHead(nn.Module):
                 if self.objectness_priors is not None:
                     obj_bias = float(_logit(self.objectness_priors[scale_idx]).item())
                 nn.init.constant_(reg_conv.bias[0], obj_bias)
-                nn.init.constant_(reg_conv.bias[1:5], 1.0)
+                nn.init.constant_(reg_conv.bias[1:], 0.0 if self.reg_max > 0 else 1.0)
             if isinstance(cls_conv, nn.Conv2d) and cls_conv.bias is not None:
                 cls_conv.bias.data.copy_(class_bias.to(cls_conv.bias.device))
 
@@ -359,7 +366,7 @@ class DecoupledDetectionHead(nn.Module):
         for feature, reg_head, cls_head in zip(features, self.reg_heads, self.cls_heads):
             reg_obj = reg_head(feature)
             cls_logits = cls_head(feature)
-            outputs.append(torch.cat([reg_obj[:, :1], reg_obj[:, 1:5], cls_logits], dim=1))
+            outputs.append(torch.cat([reg_obj[:, :1], reg_obj[:, 1:], cls_logits], dim=1))
         return outputs
 
 
@@ -376,6 +383,7 @@ class YoloResNet50(nn.Module):
         head_variant: str = "coupled",
         use_attention: bool = False,
         use_p2: bool = False,
+        reg_max: int = 0,
         class_priors: list[float] | tuple[float, ...] | torch.Tensor | None = None,
         objectness_priors: list[float] | tuple[float, ...] | torch.Tensor | None = None,
     ):
@@ -387,6 +395,7 @@ class YoloResNet50(nn.Module):
         self.num_classes = num_classes
         self.backbone_name = backbone_name
         self.use_p2 = use_p2
+        self.reg_max = reg_max
         self.strides = (4, 8, 16, 32) if use_p2 else (8, 16, 32)
         num_scales = len(self.strides)
         if backbone_name == "resnet50":
@@ -409,6 +418,7 @@ class YoloResNet50(nn.Module):
                 class_priors=class_priors,
                 objectness_priors=objectness_priors,
                 num_scales=num_scales,
+                reg_max=reg_max,
             )
         else:
             self.head = DetectionHead(
@@ -417,6 +427,7 @@ class YoloResNet50(nn.Module):
                 class_priors=class_priors,
                 objectness_priors=objectness_priors,
                 num_scales=num_scales,
+                reg_max=reg_max,
             )
 
     def forward(self, x: torch.Tensor) -> list[torch.Tensor]:

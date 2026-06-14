@@ -27,6 +27,8 @@ class DetectionLoss(nn.Module):
         negative_image_weight: float = 1.0,
         iou_aware_obj: bool = False,
         iou_aware_min: float = 0.05,
+        reg_max: int = 0,
+        dfl_weight: float = 0.5,
     ):
         super().__init__()
         if box_loss not in {"giou", "diou", "ciou"}:
@@ -47,6 +49,10 @@ class DetectionLoss(nn.Module):
         self.negative_image_weight = negative_image_weight
         self.iou_aware_obj = iou_aware_obj
         self.iou_aware_min = iou_aware_min
+        self.reg_max = reg_max
+        self.dfl_weight = dfl_weight
+        if reg_max < 0:
+            raise ValueError("reg_max must be non-negative.")
         weights = torch.ones(num_classes, dtype=torch.float32) if class_weights is None else torch.tensor(class_weights, dtype=torch.float32)
         if weights.numel() != num_classes:
             raise ValueError(f"class_weights must contain {num_classes} values.")
@@ -108,6 +114,50 @@ class DetectionLoss(nn.Module):
         )
         return boxes.clamp(min=0)
 
+    def _decode_dfl_boxes(self, dist_logits: torch.Tensor, stride: int) -> torch.Tensor:
+        b, _, h, w = dist_logits.shape
+        device = dist_logits.device
+        bins = self.reg_max + 1
+        yy, xx = torch.meshgrid(
+            torch.arange(h, device=device, dtype=torch.float32),
+            torch.arange(w, device=device, dtype=torch.float32),
+            indexing="ij",
+        )
+        centers_x = (xx + 0.5) * stride
+        centers_y = (yy + 0.5) * stride
+        proj = torch.arange(bins, device=device, dtype=torch.float32)
+        distances = dist_logits.view(b, 4, bins, h, w).softmax(dim=2)
+        distances = (distances * proj.view(1, 1, bins, 1, 1)).sum(dim=2) * stride
+        left, top, right, bottom = distances[:, 0], distances[:, 1], distances[:, 2], distances[:, 3]
+        boxes = torch.stack(
+            [
+                centers_x.unsqueeze(0) - left,
+                centers_y.unsqueeze(0) - top,
+                centers_x.unsqueeze(0) + right,
+                centers_y.unsqueeze(0) + bottom,
+            ],
+            dim=1,
+        )
+        return boxes.clamp(min=0)
+
+    def _distribution_focal_loss(self, dist_logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        if dist_logits.numel() == 0:
+            return dist_logits.sum()
+        bins = self.reg_max + 1
+        targets = targets.clamp(min=0, max=self.reg_max - 1e-3)
+        left = targets.floor().long()
+        right = (left + 1).clamp(max=self.reg_max)
+        weight_left = right.float() - targets
+        weight_right = targets - left.float()
+        logits = dist_logits.reshape(-1, bins)
+        left = left.reshape(-1)
+        right = right.reshape(-1)
+        weight_left = weight_left.reshape(-1)
+        weight_right = weight_right.reshape(-1)
+        loss_left = F.cross_entropy(logits, left, reduction="none") * weight_left
+        loss_right = F.cross_entropy(logits, right, reduction="none") * weight_right
+        return (loss_left + loss_right).mean()
+
     def forward(
         self,
         outputs: list[torch.Tensor],
@@ -125,6 +175,7 @@ class DetectionLoss(nn.Module):
             obj_target = torch.zeros((bsz, feat_h, feat_w), device=device)
             cls_target = torch.zeros((bsz, feat_h, feat_w, self.num_classes), device=device)
             box_target = torch.zeros((bsz, feat_h, feat_w, 4), device=device)
+            center_target = torch.zeros((bsz, feat_h, feat_w, 2), device=device)
             pos_mask = torch.zeros((bsz, feat_h, feat_w), dtype=torch.bool, device=device)
             area_target = torch.full((bsz, feat_h, feat_w), float("inf"), device=device)
 
@@ -169,12 +220,20 @@ class DetectionLoss(nn.Module):
                         cls_target[batch_idx, gy, gx].zero_()
                         cls_target[batch_idx, gy, gx, class_idx] = 1.0
                         box_target[batch_idx, gy, gx] = box
+                        center_target[batch_idx, gy, gx, 0] = (gx + 0.5) * stride
+                        center_target[batch_idx, gy, gx, 1] = (gy + 0.5) * stride
                         pos_mask[batch_idx, gy, gx] = True
 
             obj_logits = output[:, 0]
-            raw_box = output[:, 1:5]
-            cls_logits = output[:, 5 : 5 + self.num_classes].permute(0, 2, 3, 1)
-            decoded_boxes = self._decode_boxes(raw_box, stride).permute(0, 2, 3, 1)
+            if self.reg_max > 0:
+                box_channels = 4 * (self.reg_max + 1)
+                raw_box = output[:, 1 : 1 + box_channels]
+                cls_logits = output[:, 1 + box_channels : 1 + box_channels + self.num_classes].permute(0, 2, 3, 1)
+                decoded_boxes = self._decode_dfl_boxes(raw_box, stride).permute(0, 2, 3, 1)
+            else:
+                raw_box = output[:, 1:5]
+                cls_logits = output[:, 5 : 5 + self.num_classes].permute(0, 2, 3, 1)
+                decoded_boxes = self._decode_boxes(raw_box, stride).permute(0, 2, 3, 1)
 
             if self.iou_aware_obj and pos_mask.any():
                 with torch.no_grad():
@@ -208,7 +267,22 @@ class DetectionLoss(nn.Module):
                     iou_loss = distance_iou_loss(pred_boxes, tgt_boxes)
                 else:
                     iou_loss = generalized_iou_loss(pred_boxes, tgt_boxes)
-                box_losses.append(l1 / self.image_size + iou_loss)
+                if self.reg_max > 0:
+                    pos_centers = center_target[pos_mask]
+                    target_distances = torch.stack(
+                        [
+                            pos_centers[:, 0] - tgt_boxes[:, 0],
+                            pos_centers[:, 1] - tgt_boxes[:, 1],
+                            tgt_boxes[:, 2] - pos_centers[:, 0],
+                            tgt_boxes[:, 3] - pos_centers[:, 1],
+                        ],
+                        dim=1,
+                    ) / stride
+                    dist_logits = raw_box.permute(0, 2, 3, 1)[pos_mask].view(-1, 4, self.reg_max + 1)
+                    dfl = self._distribution_focal_loss(dist_logits, target_distances)
+                    box_losses.append(iou_loss + self.dfl_weight * dfl)
+                else:
+                    box_losses.append(l1 / self.image_size + iou_loss)
                 total_pos += int(pos_mask.sum().item())
 
         obj_loss = torch.stack(obj_losses).sum() if obj_losses else outputs[0].sum() * 0

@@ -19,6 +19,7 @@ def decode_outputs(
     nms_iou: float = 0.5,
     max_detections: int = 100,
     strides: tuple[int, ...] = (8, 16, 32),
+    reg_max: int = 0,
     flip_horizontal: bool = False,
 ) -> list[list[dict[str, object]]]:
     batch_size = outputs[0].shape[0]
@@ -32,8 +33,13 @@ def decode_outputs(
             pred = output[batch_idx]
             _, feat_h, feat_w = pred.shape
             obj = torch.sigmoid(pred[0])
-            raw_box = pred[1:5]
-            cls_prob = torch.sigmoid(pred[5:])
+            if reg_max > 0:
+                box_channels = 4 * (reg_max + 1)
+                raw_box = pred[1 : 1 + box_channels]
+                cls_prob = torch.sigmoid(pred[1 + box_channels :])
+            else:
+                raw_box = pred[1:5]
+                cls_prob = torch.sigmoid(pred[5:])
             scores, classes = (obj.unsqueeze(0) * cls_prob).max(dim=0)
             keep = scores > conf_threshold
             if not keep.any():
@@ -46,7 +52,13 @@ def decode_outputs(
             )
             centers_x = (xx + 0.5) * stride
             centers_y = (yy + 0.5) * stride
-            distances = F.softplus(raw_box) * stride
+            if reg_max > 0:
+                bins = reg_max + 1
+                proj = torch.arange(bins, device=pred.device, dtype=torch.float32)
+                dist_prob = raw_box.view(4, bins, feat_h, feat_w).softmax(dim=1)
+                distances = (dist_prob * proj.view(1, bins, 1, 1)).sum(dim=1) * stride
+            else:
+                distances = F.softplus(raw_box) * stride
             boxes = torch.stack(
                 [
                     centers_x - distances[0],
