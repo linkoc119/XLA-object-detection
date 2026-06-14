@@ -90,6 +90,7 @@ def main() -> None:
     model = YoloResNet50(
         num_classes=len(CLASS_TO_IDX),
         pretrained_backbone=False,
+        backbone_name=checkpoint.get("backbone_name", "resnet50"),
         neck_variant=checkpoint.get("neck_variant", "baseline"),
         head_variant=checkpoint.get("head_variant", "coupled"),
         use_attention=bool(checkpoint.get("use_attention", False)),

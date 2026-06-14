@@ -104,6 +104,9 @@ class SPPF(nn.Module):
 
 
 class ResNet50Backbone(nn.Module):
+    channels_p2 = (256, 512, 1024, 2048)
+    channels = (512, 1024, 2048)
+
     def __init__(self, pretrained: bool = True, return_p2: bool = False):
         super().__init__()
         self.return_p2 = return_p2
@@ -134,19 +137,81 @@ class ResNet50Backbone(nn.Module):
         return c3, c4, c5
 
 
+class TimmFeatureBackbone(nn.Module):
+    def __init__(
+        self,
+        model_name: str,
+        pretrained: bool = True,
+        return_p2: bool = False,
+    ):
+        super().__init__()
+        self.return_p2 = return_p2
+        try:
+            import timm
+        except ImportError as exc:
+            raise ImportError(
+                "timm is required for ConvNeXtV2-Tiny. Install it with `pip install timm` "
+                "or add `timm` to requirements.txt before running on Kaggle."
+            ) from exc
+
+        out_indices = (0, 1, 2, 3) if return_p2 else (1, 2, 3)
+        candidate_names = [model_name]
+        if model_name == "convnextv2_tiny":
+            candidate_names.extend(
+                [
+                    "convnextv2_tiny.fcmae_ft_in22k_in1k",
+                    "convnextv2_tiny.fcmae_ft_in1k",
+                ]
+            )
+
+        last_error = None
+        for candidate in dict.fromkeys(candidate_names):
+            try:
+                self.model = timm.create_model(
+                    candidate,
+                    pretrained=pretrained,
+                    features_only=True,
+                    out_indices=out_indices,
+                )
+                self.model_name = candidate
+                break
+            except Exception as exc:  # pragma: no cover - depends on installed timm model registry.
+                last_error = exc
+        else:
+            raise RuntimeError(f"Could not create timm backbone '{model_name}'. Last error: {last_error}") from last_error
+
+        self.out_channels = tuple(int(ch) for ch in self.model.feature_info.channels())
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        return tuple(self.model(x))
+
+
 class FPNPAN(nn.Module):
-    def __init__(self, channels: int = 256, neck_variant: str = "baseline", use_attention: bool = False, use_p2: bool = False):
+    def __init__(
+        self,
+        channels: int = 256,
+        neck_variant: str = "baseline",
+        use_attention: bool = False,
+        use_p2: bool = False,
+        in_channels: tuple[int, ...] = (512, 1024, 2048),
+    ):
         super().__init__()
         if neck_variant not in {"baseline", "csp"}:
             raise ValueError("neck_variant must be 'baseline' or 'csp'.")
         self.neck_variant = neck_variant
         self.use_attention = use_attention
         self.use_p2 = use_p2
+        expected_features = 4 if use_p2 else 3
+        if len(in_channels) != expected_features:
+            raise ValueError(f"FPNPAN expected {expected_features} input feature channels, got {len(in_channels)}.")
         if use_p2:
-            self.lat2 = ConvBNAct(256, channels, 1)
-        self.lat3 = ConvBNAct(512, channels, 1)
-        self.lat4 = ConvBNAct(1024, channels, 1)
-        self.sppf = SPPF(2048, channels)
+            c2_channels, c3_channels, c4_channels, c5_channels = in_channels
+            self.lat2 = ConvBNAct(c2_channels, channels, 1)
+        else:
+            c3_channels, c4_channels, c5_channels = in_channels
+        self.lat3 = ConvBNAct(c3_channels, channels, 1)
+        self.lat4 = ConvBNAct(c4_channels, channels, 1)
+        self.sppf = SPPF(c5_channels, channels)
 
         self.fpn4 = self._fusion_block(channels * 2, channels)
         self.fpn3 = self._fusion_block(channels * 2, channels)
@@ -305,6 +370,7 @@ class YoloResNet50(nn.Module):
         self,
         num_classes: int = 5,
         pretrained_backbone: bool = True,
+        backbone_name: str = "resnet50",
         neck_channels: int = 256,
         neck_variant: str = "baseline",
         head_variant: str = "coupled",
@@ -316,12 +382,26 @@ class YoloResNet50(nn.Module):
         super().__init__()
         if head_variant not in {"coupled", "decoupled"}:
             raise ValueError("head_variant must be 'coupled' or 'decoupled'.")
+        if backbone_name not in {"resnet50", "convnextv2_tiny"}:
+            raise ValueError("backbone_name must be 'resnet50' or 'convnextv2_tiny'.")
         self.num_classes = num_classes
+        self.backbone_name = backbone_name
         self.use_p2 = use_p2
         self.strides = (4, 8, 16, 32) if use_p2 else (8, 16, 32)
         num_scales = len(self.strides)
-        self.backbone = ResNet50Backbone(pretrained=pretrained_backbone, return_p2=use_p2)
-        self.neck = FPNPAN(neck_channels, neck_variant=neck_variant, use_attention=use_attention, use_p2=use_p2)
+        if backbone_name == "resnet50":
+            self.backbone = ResNet50Backbone(pretrained=pretrained_backbone, return_p2=use_p2)
+            backbone_channels = ResNet50Backbone.channels_p2 if use_p2 else ResNet50Backbone.channels
+        else:
+            self.backbone = TimmFeatureBackbone(backbone_name, pretrained=pretrained_backbone, return_p2=use_p2)
+            backbone_channels = self.backbone.out_channels
+        self.neck = FPNPAN(
+            neck_channels,
+            neck_variant=neck_variant,
+            use_attention=use_attention,
+            use_p2=use_p2,
+            in_channels=backbone_channels,
+        )
         if head_variant == "decoupled":
             self.head = DecoupledDetectionHead(
                 neck_channels,

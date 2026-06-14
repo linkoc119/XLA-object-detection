@@ -18,7 +18,7 @@ from utils.metrics import evaluate_map
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a from-scratch YOLO-style detector with ResNet-50 backbone.")
+    parser = argparse.ArgumentParser(description="Train a from-scratch YOLO-style detector.")
     parser.add_argument("--train_data", default="./annotations/train.json")
     parser.add_argument("--val_data", default="./annotations/val.json")
     parser.add_argument("--image_dir", default="./train/images")
@@ -30,6 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--image_size", type=int, default=512)
     parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--backbone_name", choices=["resnet50", "convnextv2_tiny"], default="resnet50")
     parser.add_argument("--backbone_lr_mult", type=float, default=1.0)
     parser.add_argument("--freeze_backbone", action="store_true")
     parser.add_argument("--weight_decay", type=float, default=1e-4)
@@ -292,6 +293,7 @@ def save_checkpoint(
         "backbone_lr_mult": args.backbone_lr_mult,
         "freeze_backbone": args.freeze_backbone,
         "architecture": "YoloResNet50",
+        "backbone_name": args.backbone_name,
         "neck_variant": args.neck_variant,
         "head_variant": args.head_variant,
         "use_attention": args.use_attention,
@@ -330,16 +332,16 @@ def save_checkpoint(
 
 def append_experiment_log(path: Path, args: argparse.Namespace, best_score: dict, best_epoch: int, checkpoint_path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    run_name = args.experiment_name or f"resnet50-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    run_name = args.experiment_name or f"{args.backbone_name}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
     per_class = best_score.get("per_class", {})
     lines = [
         f"\n## {run_name}",
         f"- Time: {datetime.now().isoformat(timespec='seconds')}",
         f"- Device: {device_name}",
-        "- Backbone: ResNet-50 ImageNet pretrained"
+        f"- Backbone: {args.backbone_name} ImageNet pretrained"
         + (" disabled" if args.no_pretrained_backbone else " enabled"),
-        "- Architecture: ResNet-50 C3/C4/C5 + custom FPN/PAN + SPPF + anchor-free head",
+        f"- Architecture: {args.backbone_name} multi-scale features + custom FPN/PAN + SPPF + anchor-free head",
         f"- Neck/head: neck_variant={args.neck_variant}, head_variant={args.head_variant}, use_attention={args.use_attention}",
         f"- P2 scale: enabled={args.use_p2}",
         f"- EMA: enabled={not args.no_ema}, decay={args.ema_decay}",
@@ -379,6 +381,7 @@ def main() -> None:
     if args.resume:
         resume_checkpoint = torch.load(args.resume, map_location=device)
         args.image_size = int(resume_checkpoint.get("image_size", args.image_size))
+        args.backbone_name = resume_checkpoint.get("backbone_name", "resnet50")
         args.neck_variant = resume_checkpoint.get("neck_variant", "baseline")
         args.head_variant = resume_checkpoint.get("head_variant", "coupled")
         args.use_attention = bool(resume_checkpoint.get("use_attention", False))
@@ -421,6 +424,7 @@ def main() -> None:
     model = YoloResNet50(
         num_classes=len(CLASS_TO_IDX),
         pretrained_backbone=not args.no_pretrained_backbone,
+        backbone_name=args.backbone_name,
         neck_variant=args.neck_variant,
         head_variant=args.head_variant,
         use_attention=args.use_attention,
