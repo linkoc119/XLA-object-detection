@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import urllib.request
 from pathlib import Path
 
 import torch
@@ -14,20 +15,46 @@ from utils.inference import decode_outputs
 from utils.bbox import nms
 
 
+DEFAULT_CHECKPOINT_URL = (
+    "https://huggingface.co/Linhnv119/object-detection-assignment/resolve/main/best.pth"
+)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run inference and export predictions.json.")
     parser.add_argument("--image_dir", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--checkpoint", default="./models/best.pth")
+    parser.add_argument("--checkpoint_url", default=DEFAULT_CHECKPOINT_URL)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--image_size", type=int, default=None)
     parser.add_argument("--conf_threshold", type=float, default=None)
     parser.add_argument("--nms_iou", type=float, default=None)
     parser.add_argument("--max_detections", type=int, default=100)
-    parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--checkpoint_key", choices=["auto", "model", "ema_model"], default="auto")
-    parser.add_argument("--tta_flip", action="store_true")
+    parser.add_argument("--tta_flip", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
+
+
+def ensure_checkpoint(checkpoint_path: Path, checkpoint_url: str) -> Path:
+    if checkpoint_path.exists():
+        return checkpoint_path
+    if not checkpoint_url:
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = checkpoint_path.with_suffix(checkpoint_path.suffix + ".download")
+    print(f"Checkpoint not found at {checkpoint_path}. Downloading from {checkpoint_url}")
+    try:
+        urllib.request.urlretrieve(checkpoint_url, temp_path)
+        temp_path.replace(checkpoint_path)
+    except Exception:
+        if temp_path.exists():
+            temp_path.unlink()
+        raise
+    print(f"Downloaded checkpoint to {checkpoint_path}")
+    return checkpoint_path
 
 
 def merge_predictions(
@@ -77,14 +104,12 @@ def merge_predictions(
 
 def main() -> None:
     args = parse_args()
-    checkpoint_path = Path(args.checkpoint)
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    checkpoint_path = ensure_checkpoint(Path(args.checkpoint), args.checkpoint_url)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = torch.load(checkpoint_path, map_location=device)
     image_size = args.image_size or int(checkpoint.get("image_size", 512))
-    conf_threshold = args.conf_threshold if args.conf_threshold is not None else float(checkpoint.get("conf_threshold", 0.25))
+    conf_threshold = args.conf_threshold if args.conf_threshold is not None else float(checkpoint.get("conf_threshold", 0.01))
     nms_iou = args.nms_iou if args.nms_iou is not None else float(checkpoint.get("nms_iou", 0.5))
 
     model = YoloResNet50(
